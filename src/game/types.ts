@@ -17,7 +17,54 @@ export type ZoneId =
   | 'cavern'
   | 'ruins'
   | 'terrace'
-  | 'island';
+  | 'island'
+  | 'frontier';
+
+export type BiomePresetId = 'verdant' | 'arid_winds' | 'mystic_night' | 'archipelago';
+
+export interface BiomePresetMeta {
+  id: BiomePresetId;
+  name: string;
+  desc: string;
+  accentColor: string;
+  grassHex: number;
+  forestHex: number;
+  rockHex: number;
+  skyTintHex: number;
+  waterHex: number;
+  riverAmpScale: number;
+  hillScale: number;
+  blightRate: number;
+}
+
+export interface WorldSeedConfig {
+  seed: number;
+  seedLabel: string;
+  biome: BiomePresetId;
+  keepAchievements?: boolean;
+}
+
+export interface BlightNodeState {
+  id: string;
+  x: number;
+  z: number;
+  hp: number;
+  maxHp: number;
+  purified: boolean;
+  radius: number;
+  chunkKey?: string;
+}
+
+export interface GameOverState {
+  reason: 'health' | 'collapse';
+  title: string;
+  message: string;
+  daysSurvived: number;
+  blightPurified: number;
+  vitality: number;
+  seedLabel: string;
+  biomeLabel: string;
+}
 
 export type NpcId = 'noa' | 'mika' | 'tali' | 'oren';
 
@@ -129,6 +176,7 @@ export interface WorldResourceNode {
   respawnAt: number;
   hiddenUntilPulse?: boolean;
   revealedUntil?: number;
+  chunkKey?: string;
 }
 
 export interface RuinPillarState {
@@ -138,7 +186,30 @@ export interface RuinPillarState {
   activated: boolean;
 }
 
+export type AchievementCategory = 'explore' | 'build' | 'bond' | 'mastery';
+
+export interface AchievementDefinition {
+  id: string;
+  title: string;
+  desc: string;
+  category: AchievementCategory;
+  categoryLabel: string;
+  target: number;
+  reward?: Partial<ResourceInventory>;
+}
+
+export interface AchievementState {
+  id: string;
+  unlocked: boolean;
+  unlockedDay?: number;
+  current: number;
+  target: number;
+}
+
 export interface GameState {
+  worldSeed: number;
+  seedLabel: string;
+  biomePreset: BiomePresetId;
   inv: ResourceInventory;
   completedQuests: string[];
   promises: PromiseRecord[];
@@ -148,6 +219,14 @@ export interface GameState {
   ruinPillars: boolean[];
   cavernLit: boolean;
   communityProjects: Record<string, number>; // projectId -> stage (0..3)
+  unlockedAchievements: Record<string, number>; // achievementId -> day unlocked
+  visitedZones: ZoneId[];
+  pulsesTriggered: number;
+  purifiedBlightIds: string[];
+  blightPurified: number;
+  health: number; // 0..100
+  collapseTimer: number; // 0..30s emergency countdown when vitality <= 0 under blight
+  gameOver: GameOverState | null;
   journal: JournalEntry[];
   realPlan: RealActionPlan | null;
   realDoneCount: number;
@@ -160,7 +239,7 @@ export interface GameState {
 }
 
 export interface NearbyPrompt {
-  kind: 'npc' | 'resource' | 'building' | 'secret' | 'pillar' | 'project';
+  kind: 'npc' | 'resource' | 'building' | 'secret' | 'pillar' | 'project' | 'blight';
   id: string;
   title: string;
   subtitle: string;
@@ -180,10 +259,24 @@ export interface HudSnapshot {
   weather: WeatherType;
   weatherLabel: string;
   vitality: number; // 0..100 valley ecosystem score
+  health: number; // 0..100 player survival HP
   stamina: number; // 0..100
+  threatLevel: number; // 0..100 active blight/night threat
+  activeBlightCount: number;
+  activeWispsCount: number;
+  blightPurified: number;
+  collapseCountdown: number | null;
+  worldSeed: number;
+  seedLabel: string;
+  biomePreset: BiomePresetId;
+  biomeLabel: string;
+  distanceFromOrigin: number;
+  isNightThreat: boolean;
+  gameOver: GameOverState | null;
   pulseCooldown: number; // 0..1 (0 = ready)
   synergies: SynergyLink[];
   npcNeeds: Record<NpcId, NpcNeedState>;
+  npcPositions: Record<NpcId, { x: number; z: number; activity: string }>;
   npcMemories: Record<NpcId, NpcMemory>;
   buildings: PlacedBuilding[];
   completedQuests: string[];
@@ -192,6 +285,7 @@ export interface HudSnapshot {
   ruinPillars: boolean[];
   cavernLit: boolean;
   communityProjects: Record<string, number>;
+  achievements: AchievementState[];
   journal: JournalEntry[];
   realPlan: RealActionPlan | null;
   nearby: NearbyPrompt | null;
@@ -204,3 +298,10 @@ export interface ToastMessage {
   text: string;
   tone: 'info' | 'good' | 'warn' | 'secret';
 }
+
+export interface AudioMixSettings {
+  muted: boolean;
+  musicVolume: number; // 0..1
+  ambienceVolume: number; // 0..1
+}
+

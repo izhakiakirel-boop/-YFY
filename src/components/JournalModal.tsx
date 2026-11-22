@@ -1,7 +1,30 @@
 import { useState } from 'react';
-import { BookOpen, Compass, HeartHandshake, MapPin, Sparkles, Users, X } from 'lucide-react';
-import { COMMUNITY_PROJECTS_DATA, INITIAL_SECRETS, NPCS_BASE } from '../game/data';
-import type { HudSnapshot, RealActionPlan } from '../game/types';
+import {
+  Award,
+  BookOpen,
+  CheckCircle2,
+  Compass,
+  HeartHandshake,
+  Lock,
+  MapPin,
+  Sparkles,
+  Trophy,
+  Users,
+  X,
+} from 'lucide-react';
+import {
+  ACHIEVEMENTS,
+  COMMUNITY_PROJECTS_DATA,
+  INITIAL_SECRETS,
+  NPCS_BASE,
+  RESOURCES,
+} from '../game/data';
+import type {
+  AchievementCategory,
+  HudSnapshot,
+  RealActionPlan,
+  ResourceType,
+} from '../game/types';
 
 interface JournalModalProps {
   hud: HudSnapshot;
@@ -10,7 +33,8 @@ interface JournalModalProps {
   onClose: () => void;
 }
 
-type TabId = 'people' | 'secrets' | 'log' | 'bridge';
+type TabId = 'people' | 'secrets' | 'achievements' | 'log' | 'bridge';
+type AchievementFilter = 'all' | AchievementCategory;
 
 export function JournalModal({
   hud,
@@ -19,9 +43,14 @@ export function JournalModal({
   onClose,
 }: JournalModalProps) {
   const [tab, setTab] = useState<TabId>('people');
+  const [achFilter, setAchFilter] = useState<AchievementFilter>('all');
   const [action, setAction] = useState(hud.realPlan?.action || '');
   const [when, setWhen] = useState(hud.realPlan?.when || '');
   const [ifThen, setIfThen] = useState(hud.realPlan?.ifThen || '');
+
+  const unlockedCount = hud.achievements.filter((a) => a.unlocked).length;
+  const totalAch = ACHIEVEMENTS.length;
+  const achPercent = totalAch > 0 ? Math.round((unlockedCount / totalAch) * 100) : 0;
 
   const presetChoices = [
     'להקשיב למישהו קרוב במשך 5 דקות בלי לנסות לתקן מיד',
@@ -55,6 +84,7 @@ export function JournalModal({
           {[
             { id: 'people', label: 'תושבים ופרויקטים', icon: Users },
             { id: 'secrets', label: 'סודות ועתיקות', icon: Sparkles },
+            { id: 'achievements', label: 'הישגים', icon: Trophy },
             { id: 'log', label: 'יומן דרך', icon: Compass },
             { id: 'bridge', label: 'הגשר למציאות', icon: HeartHandshake },
           ].map((t) => {
@@ -64,13 +94,13 @@ export function JournalModal({
               <button
                 key={t.id}
                 onClick={() => setTab(t.id as TabId)}
-                className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap transition-colors ${
+                className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
                   active
                     ? 'bg-[#7ef2c9] text-[#072226]'
                     : 'bg-white/5 hover:bg-white/10 text-[#b5d2cf]'
                 }`}
               >
-                <Icon className="w-3.5 h-3.5" />
+                <Icon className="w-3.5 h-3.5 shrink-0" />
                 <span>{t.label}</span>
               </button>
             );
@@ -194,6 +224,137 @@ export function JournalModal({
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {tab === 'achievements' && (
+            <div className="space-y-4">
+              {/* Overall progress header */}
+              <div className="p-4 rounded-2xl bg-white/5 border border-white/10 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Award className="w-4 h-4 text-[#f5b971] shrink-0" />
+                    <h3 className="font-display text-sm font-bold text-[#edf6f2]">
+                      התקדמות הישגי העמק
+                    </h3>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-[#9ec0bd] font-mono-num">
+                    <span className="text-[#7ef2c9] font-bold">
+                      {unlockedCount}/{totalAch} הושלמו
+                    </span>
+                    <span aria-hidden="true">·</span>
+                    <span>{achPercent}%</span>
+                  </div>
+                </div>
+                <div className="h-2 rounded-full bg-black/40 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-[#7ef2c9] transition-all duration-300"
+                    style={{ width: `${achPercent}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Interactive Category Filter */}
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+                {[
+                  { id: 'all', label: 'הכל' },
+                  { id: 'explore', label: 'חקירה' },
+                  { id: 'build', label: 'בנייה' },
+                  { id: 'bond', label: 'קהילה' },
+                  { id: 'mastery', label: 'מומחיות' },
+                ].map((f) => {
+                  const active = achFilter === f.id;
+                  return (
+                    <button
+                      key={f.id}
+                      onClick={() => setAchFilter(f.id as AchievementFilter)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
+                        active
+                          ? 'bg-[#f5b971] text-[#072226]'
+                          : 'bg-white/5 hover:bg-white/10 text-[#b5d2cf]'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Achievements List */}
+              <div className="grid sm:grid-cols-2 gap-3">
+                {ACHIEVEMENTS.filter((def) => achFilter === 'all' || def.category === achFilter).map(
+                  (def) => {
+                    const st = hud.achievements.find((a) => a.id === def.id);
+                    const unlocked = st?.unlocked ?? false;
+                    const current = st?.current ?? 0;
+                    const target = def.target;
+                    const pct = Math.min(100, Math.round((current / target) * 100));
+                    const rewardParts = def.reward
+                      ? Object.entries(def.reward)
+                          .map(([rk, amt]) => `+${amt} ${RESOURCES[rk as ResourceType].name}`)
+                          .join(' · ')
+                      : null;
+
+                    return (
+                      <div
+                        key={def.id}
+                        className={`p-4 rounded-2xl border space-y-2 transition-colors ${
+                          unlocked
+                            ? 'bg-[#7ef2c9]/10 border-[#7ef2c9]/40'
+                            : 'bg-white/[0.03] border-white/10'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <h4 className="text-sm font-bold text-[#edf6f2] leading-snug">
+                              {def.title}
+                            </h4>
+                            <div className="flex items-center gap-1.5 text-[11px] text-[#9ec0bd] mt-0.5 font-mono-num">
+                              <span>{def.categoryLabel}</span>
+                              <span aria-hidden="true">·</span>
+                              <span>
+                                {unlocked
+                                  ? st?.unlockedDay
+                                    ? `נפתח ביום ${st.unlockedDay}`
+                                    : 'הושלם'
+                                  : `${current}/${target}`}
+                              </span>
+                            </div>
+                          </div>
+                          {unlocked ? (
+                            <CheckCircle2
+                              className="w-4 h-4 text-[#7ef2c9] shrink-0 mt-0.5"
+                              aria-label="הישג הושלם"
+                            />
+                          ) : (
+                            <Lock
+                              className="w-4 h-4 text-[#739390] shrink-0 mt-0.5"
+                              aria-label="טרם הושלם"
+                            />
+                          )}
+                        </div>
+
+                        <p className="text-xs text-[#cde2dd] leading-relaxed">{def.desc}</p>
+
+                        {!unlocked && (
+                          <div className="h-1.5 rounded-full bg-black/35 overflow-hidden">
+                            <div
+                              className="h-full rounded-full bg-[#f5b971]/80 transition-all duration-300"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                        )}
+
+                        {rewardParts && (
+                          <div className="text-[11px] text-[#a5c6c3] pt-0.5">
+                            תגמול: <span className="text-[#f5b971] font-medium">{rewardParts}</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  },
+                )}
+              </div>
             </div>
           )}
 

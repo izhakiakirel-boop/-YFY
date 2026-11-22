@@ -1,4 +1,7 @@
 import type {
+  AchievementDefinition,
+  BiomePresetId,
+  BiomePresetMeta,
   BlueprintId,
   CommunityProjectState,
   NpcId,
@@ -263,7 +266,111 @@ export const ZONES: Record<
     subtitle: 'אי מוקף זרם מזרחי ומפל צלול. שמור לממציאים שלא מפחדים לחקור.',
     color: '#8ff2b4',
   },
+  frontier: {
+    name: 'מרחבי הספר האינסופיים',
+    subtitle: 'ארץ פרא פתוחה ללא גבול — רכסים, מונוליתים עתיקים, נבגי קמילה ומשאבים נדירים.',
+    color: '#f5b971',
+  },
 };
+
+export const BIOME_PRESETS: Record<BiomePresetId, BiomePresetMeta> = {
+  verdant: {
+    id: 'verdant',
+    name: 'עמק ירוק עשיר',
+    desc: 'אחו פורח, יערות אלון זוהרים וזרם מים רגוע עם איום קמילה מאוזן.',
+    accentColor: '#7ef2c9',
+    grassHex: 0x478052,
+    forestHex: 0x33664b,
+    rockHex: 0x6f7a76,
+    skyTintHex: 0x7ebde0,
+    waterHex: 0x2c8da1,
+    riverAmpScale: 1.0,
+    hillScale: 1.0,
+    blightRate: 1.0,
+  },
+  arid_winds: {
+    id: 'arid_winds',
+    name: 'מדבר רוחות ומצוקים',
+    desc: 'רמות טרקוטה, רכסי סלע תלולים, רוחות חזקות וקמילה תוקפנית יותר.',
+    accentColor: '#f5b971',
+    grassHex: 0xa48554,
+    forestHex: 0x687246,
+    rockHex: 0x8b6e58,
+    skyTintHex: 0xc2ab8e,
+    waterHex: 0x357a85,
+    riverAmpScale: 0.72,
+    hillScale: 1.38,
+    blightRate: 1.28,
+  },
+  mystic_night: {
+    id: 'mystic_night',
+    name: 'יער לילה מכושף',
+    desc: 'אווירת בין-ערביים מסתורית, קריסטלים שופעים, אך רוחות צל צפופות יותר.',
+    accentColor: '#c9a6ff',
+    grassHex: 0x2f595a,
+    forestHex: 0x21444e,
+    rockHex: 0x4b556b,
+    skyTintHex: 0x52699c,
+    waterHex: 0x26658c,
+    riverAmpScale: 1.05,
+    hillScale: 1.15,
+    blightRate: 1.35,
+  },
+  archipelago: {
+    id: 'archipelago',
+    name: 'ארכיפלג נהרות ואיים',
+    desc: 'מישורי מים רחבים, נהרות מתפתלים ואיים פראיים מלאי זרעים ומי מעיין.',
+    accentColor: '#63c5ff',
+    grassHex: 0x428862,
+    forestHex: 0x2e6e58,
+    rockHex: 0x697c7e,
+    skyTintHex: 0x82c7e6,
+    waterHex: 0x259bb8,
+    riverAmpScale: 1.65,
+    hillScale: 0.65,
+    blightRate: 0.9,
+  },
+};
+
+export interface NpcPatrolStop {
+  x: number;
+  z: number;
+  pause: number;
+  activity: string;
+}
+
+export const NPC_PATROL_ROUTES: Record<NpcId, NpcPatrolStop[]> = {
+  noa: [
+    { x: -6, z: -15, pause: 5, activity: 'בודקת שרטוטי גשר' },
+    { x: 2.2, z: -14, pause: 5.5, activity: 'סוקרת את קורות הגדה' },
+    { x: -13, z: 6, pause: 5, activity: 'מבקרת במרכז הכיכר' },
+    { x: -2.5, z: 45, pause: 5.5, activity: 'בוחנת את אבני המעבר בדרום' },
+  ],
+  mika: [
+    { x: 40, z: -20, pause: 5, activity: 'מסיירת בשביל היער' },
+    { x: 56, z: -42, pause: 6, activity: 'מקשיבה להד המערה' },
+    { x: 47, z: -4, pause: 5, activity: 'בודקת את עצי הזוהר' },
+    { x: 31, z: -15, pause: 5, activity: 'מתקרבת לשפת הנחל' },
+  ],
+  tali: [
+    { x: -52, z: 46, pause: 6, activity: 'בודקת לחות בטרסה' },
+    { x: -64, z: 57, pause: 5.5, activity: 'מטפחת זרעים עתיקים' },
+    { x: -37, z: 29, pause: 4.5, activity: 'מסיירת במעלה השביל' },
+    { x: -24, z: 14, pause: 5, activity: 'עוצרת בשולי הכיכר' },
+  ],
+  oren: [
+    { x: -12, z: 14, pause: 5.5, activity: 'מתכנן את הכיכר' },
+    { x: -22, z: -6, pause: 5, activity: 'בודק את בתי הכפר' },
+    { x: -32, z: -25, pause: 5, activity: 'משקיף אל השרידים' },
+    { x: -15, z: 2, pause: 5.5, activity: 'סוקר את מצפן העמק' },
+  ],
+};
+
+export const VALLEY_BLIGHT_SPOTS: Array<{ id: string; x: number; z: number; hp: number; radius: number }> = [
+  { id: 'blight_south_bend', x: 30, z: 32, hp: 2, radius: 7.5 },
+  { id: 'blight_nw_ridge', x: -42, z: -34, hp: 2, radius: 7.5 },
+  { id: 'blight_ne_edge', x: 52, z: -46, hp: 2, radius: 7.5 },
+];
 
 export const INITIAL_SECRETS: SecretDiscovery[] = [
   {
@@ -811,3 +918,114 @@ export const DIALOGUE_TREES: Record<NpcId, Record<string, DialogueNode>> = {
     },
   },
 };
+
+export const ACHIEVEMENTS: AchievementDefinition[] = [
+  {
+    id: 'ach_first_spark',
+    title: 'ניצוץ ראשון במלאכה',
+    desc: 'הצבת את ההמצאה הראשונה שלך בשבילי העמק.',
+    category: 'build',
+    categoryLabel: 'בנייה',
+    target: 1,
+    reward: { wood: 2, glow: 1 },
+  },
+  {
+    id: 'ach_build_streak',
+    title: 'רצף בנייה הרמוני',
+    desc: 'הקמת רצף של 4 המצאות פעילות ברחבי העמק.',
+    category: 'build',
+    categoryLabel: 'בנייה',
+    target: 4,
+    reward: { glow: 2, rune: 1 },
+  },
+  {
+    id: 'ach_synergy_weaver',
+    title: 'שוזר המערכות',
+    desc: 'חיברת לפחות 2 קווי סינרגיה פעילים בין המצאות סמוכות.',
+    category: 'build',
+    categoryLabel: 'בנייה',
+    target: 2,
+    reward: { rune: 2 },
+  },
+  {
+    id: 'ach_master_architect',
+    title: 'אדריכל העמק',
+    desc: 'שדרגת המצאה לרמה 3 המתקדמת ביותר.',
+    category: 'mastery',
+    categoryLabel: 'מומחיות',
+    target: 1,
+    reward: { seed: 2, rune: 2 },
+  },
+  {
+    id: 'ach_pulse_seeker',
+    title: 'קורא התדרים',
+    desc: 'שידרת 3 גלי תהודה (Q) לסריקת משאבים ומסתורין.',
+    category: 'explore',
+    categoryLabel: 'חקירה',
+    target: 3,
+    reward: { glow: 1 },
+  },
+  {
+    id: 'ach_cavern_light',
+    title: 'מאיר המעמקים',
+    desc: 'פיזרת את הערפל והארת את מערת הגבישים התהודתית.',
+    category: 'explore',
+    categoryLabel: 'חקירה',
+    target: 1,
+    reward: { glow: 2 },
+  },
+  {
+    id: 'ach_ruins_awakener',
+    title: 'מעיר השעון העתיק',
+    desc: 'הדלקת את כל 3 עמודי הרונה בשרידים השקועים.',
+    category: 'explore',
+    categoryLabel: 'חקירה',
+    target: 3,
+    reward: { rune: 2 },
+  },
+  {
+    id: 'ach_all_secrets',
+    title: 'חוקר כל הסודות',
+    desc: 'גילית את כל 5 הסודות העתיקים במפת העמק.',
+    category: 'explore',
+    categoryLabel: 'חקירה',
+    target: 5,
+    reward: { rune: 3, seed: 3 },
+  },
+  {
+    id: 'ach_world_wanderer',
+    title: 'נווד שבעת האזורים',
+    desc: 'ביקרת בכל 7 אזורי העמק — מהכיכר ועד אי המפל החבוי.',
+    category: 'explore',
+    categoryLabel: 'חקירה',
+    target: 7,
+    reward: { water: 2, wood: 2 },
+  },
+  {
+    id: 'ach_kindred_spirits',
+    title: 'לב הקהילה',
+    desc: 'השלמת את משימות כל 4 תושבי העמק: נעה, מיקה, טלי ואורן.',
+    category: 'bond',
+    categoryLabel: 'קהילה',
+    target: 4,
+    reward: { seed: 3, glow: 2 },
+  },
+  {
+    id: 'ach_community_builder',
+    title: 'בונה המונומנטים',
+    desc: 'השלמת פרויקט קהילתי רב-שלבי עד לשלב 3/3.',
+    category: 'bond',
+    categoryLabel: 'קהילה',
+    target: 1,
+    reward: { rune: 2, seed: 2 },
+  },
+  {
+    id: 'ach_valley_bloom',
+    title: 'תחייה מלאה של העמק',
+    desc: 'הבאת את מדד חיוניות העמק ל-80% ומעלה.',
+    category: 'mastery',
+    categoryLabel: 'מומחיות',
+    target: 80,
+    reward: { seed: 3, rune: 3 },
+  },
+];

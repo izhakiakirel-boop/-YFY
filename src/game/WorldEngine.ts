@@ -1,26 +1,41 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { SoundEngine } from './audio';
 import {
+  ACHIEVEMENTS,
+  BIOME_PRESETS,
   BLUEPRINTS,
   COMMUNITY_PROJECTS_DATA,
   INITIAL_SECRETS,
+  NPC_PATROL_ROUTES,
   NPCS_BASE,
   RESOURCES,
+  VALLEY_BLIGHT_SPOTS,
   ZONES,
 } from './data';
 import {
+  createBlightNestGroup,
+  createBoulderClusterGroup,
   createCharacterRig,
   createCottage,
   createDeerGroup,
   createInventionGroup,
+  createMonolithGroup,
   createResourceNodeMesh,
   createRuinPillarGroup,
+  createShadowWispGroup,
   createTreeGroup,
   type CharacterRig,
 } from './models';
 import {
   bridgeDeckHeightAt,
+  CHUNK_SIZE,
+  chunkSeedHash,
+  createSeededRng,
   detectZone,
   FORD_Z,
   groundHeightAt,
@@ -29,12 +44,17 @@ import {
   MAIN_BRIDGE_POS,
   riverCenterX,
   riverHalfWidth,
+  setActiveWorldConfig,
   terrainSlopeAt,
   WATER_LEVEL,
   WORLD_HALF,
 } from './terrain';
 import { createProceduralTextures, type ProceduralTexturePack } from './textures';
 import type {
+  AchievementState,
+  AudioMixSettings,
+  BiomePresetId,
+  BlightNodeState,
   BlueprintId,
   GameState,
   HudSnapshot,
@@ -50,6 +70,8 @@ import type {
   ToastMessage,
   WeatherType,
   WorldResourceNode,
+  WorldSeedConfig,
+  ZoneId,
 } from './types';
 
 const SAVE_KEY = 'shozrim-world-3d-v1';
@@ -73,6 +95,8 @@ export interface EngineCallbacks {
   onInspectBuilding: (buildingId: string) => void;
   onOpenProject: (projectId: string) => void;
   onBuildModeChange: (bp: BlueprintId | null) => void;
+  onAudioChange?: (enabled: boolean) => void;
+  onAudioMixChange?: (mix: AudioMixSettings) => void;
 }
 
 function defaultNpcMemories(): Record<NpcId, NpcMemory> {
@@ -128,8 +152,16 @@ function defaultNpcMemories(): Record<NpcId, NpcMemory> {
   };
 }
 
-function createFreshState(): GameState {
+function createFreshState(
+  worldSeed = 104729,
+  seedLabel = '104729',
+  biomePreset: BiomePresetId = 'verdant',
+): GameState {
+  const biomeName = BIOME_PRESETS[biomePreset].name;
   return {
+    worldSeed,
+    seedLabel,
+    biomePreset,
     inv: { wood: 4, glow: 2, water: 2, rune: 0, seed: 0 },
     completedQuests: [],
     promises: [],
@@ -143,10 +175,18 @@ function createFreshState(): GameState {
       proj_water_conservatory: 0,
       proj_observatory: 0,
     },
+    unlockedAchievements: {},
+    visitedZones: ['plaza'],
+    pulsesTriggered: 0,
+    purifiedBlightIds: [],
+    blightPurified: 0,
+    health: 100,
+    collapseTimer: 0,
+    gameOver: null,
     journal: [
       {
         id: 'j_init',
-        text: 'הגעת אל כיכר הלב של העמק. הגשר המרכזי שבור, והטבע ממתין לידיים סקרניות.',
+        text: `הגעת אל ${biomeName} (זרע ${seedLabel}). נבגי קמילה מאיימים על האיזון — חקור, בנה וטהר בעזרת תהודה (Q).`,
         kind: 'discovery',
         day: 1,
       },
@@ -179,6 +219,10 @@ export class WorldEngine {
   private saveTimer = 0;
   private simTickTimer = 0;
 
+  // Renderer Postprocessing (GPU only)
+  private composer: EffectComposer | null = null;
+  private bloomPass: UnrealBloomPass | null = null;
+
   // Lighting & Sky
   private sunLight!: THREE.DirectionalLight;
   private hemiLight!: THREE.HemisphereLight;
@@ -187,15 +231,32 @@ export class WorldEngine {
   private sunDisc!: THREE.Mesh;
   private sunHalo!: THREE.Mesh;
   private moonDisc!: THREE.Mesh;
+  private cloudGroup = new THREE.Group();
+  private waterfallMistPoints: THREE.Points | null = null;
   private cottageWindowMats: THREE.MeshStandardMaterial[] = [];
   private waterUniforms = { uTime: { value: 0 } };
   private grassUniforms = { uTime: { value: 0 } };
+  private waterMesh!: THREE.Mesh;
 
-  // Terrain & Dynamic Ecology
+  // Terrain & Infinite Procedural Chunks
   private terrainGeo!: THREE.PlaneGeometry;
   private terrainMesh!: THREE.Mesh;
   private baseTerrainColors!: Float32Array;
   private terrainNeedsColorUpdate = true;
+  private staticPropsGroup = new THREE.Group();
+  private frontierChunks = new Map<
+    string,
+    {
+      cx: number;
+      cz: number;
+      group: THREE.Group;
+      terrainMesh: THREE.Mesh;
+      obstacles: Array<{ x: number; z: number; r: number }>;
+      resourceIds: string[];
+      blightIds: string[];
+    }
+  >();
+  private lastChunkKey = '';
 
   // Player & Controls
   private state: GameState;
@@ -209,6 +270,8 @@ export class WorldEngine {
   private isGrounded = true;
   private walkTarget: { x: number; z: number } | null = null;
   private walkWaypointMesh!: THREE.Mesh;
+  private playerHitCooldownAt = 0;
+  private lastExposureWarnAt = -100;
 
   // Camera
   private camYaw = -0.35;
@@ -228,6 +291,7 @@ export class WorldEngine {
   private resourceNodes: WorldResourceNode[] = [];
   private resourceMeshes = new Map<string, THREE.Group>();
   private npcRigs = new Map<NpcId, { rig: CharacterRig; x: number; z: number; yaw: number; phase: number }>();
+  private npcPatrolStates = new Map<NpcId, { stopIdx: number; pauseTimer: number; activity: string }>();
   private buildingMeshes = new Map<string, THREE.Group>();
   private buildingPointLights = new Map<string, THREE.PointLight>();
   private synergyArcsGroup = new THREE.Group();
@@ -238,14 +302,54 @@ export class WorldEngine {
   private cavernLight!: THREE.PointLight;
   private projectMarkers = new Map<string, THREE.Group>();
 
+  // Threats, Blight & Shadow Wisps
+  private blightNodes = new Map<string, BlightNodeState & { group: THREE.Group }>();
+  private shadowWisps: Array<{
+    id: string;
+    x: number;
+    z: number;
+    yaw: number;
+    hp: number;
+    maxHp: number;
+    stunUntil: number;
+    homeNodeId?: string;
+    phase: number;
+    group: THREE.Group;
+  }> = [];
+  private wispSpawnTimer = 0;
+
   // Wildlife & Particles
   private deerList: Array<{ group: THREE.Group; x: number; z: number; yaw: number; phase: number; minVitality: number }> = [];
   private birdsGroup = new THREE.Group();
   private firefliesPoints!: THREE.Points;
   private rainPoints!: THREE.Points;
 
-  // Pulse wave
+  // Pulse wave & Custom Shader Overlays
   private pulseRing!: THREE.Mesh;
+  private pulseDome!: THREE.Mesh;
+  private pulseUniforms = {
+    uOrigin: { value: new THREE.Vector3() },
+    uTime: { value: -1 },
+  };
+  private pulseHighlights: Array<{
+    id: string;
+    kind: 'resource' | 'secret' | 'pillar' | 'npc' | 'project' | 'blight';
+    group: THREE.Group;
+    mat: THREE.ShaderMaterial;
+    getPos: () => { x: number; z: number };
+    isEligible: () => boolean;
+    startAt: number;
+    endAt: number;
+  }> = [];
+  private buildingHighlights: Array<{
+    id: string;
+    group: THREE.Group;
+    mat: THREE.ShaderMaterial;
+    x: number;
+    z: number;
+    startAt: number;
+    endAt: number;
+  }> = [];
   private pulseActive = false;
   private pulseAge = 0;
   private pulseOrigin = new THREE.Vector3();
@@ -266,6 +370,7 @@ export class WorldEngine {
     this.container = container;
     this.callbacks = callbacks;
     this.state = this.loadState();
+    setActiveWorldConfig(this.state.worldSeed, this.state.biomePreset);
     this.playerX = this.state.playerPos.x;
     this.playerZ = this.state.playerPos.z;
     this.playerY = groundHeightAt(this.playerX, this.playerZ);
@@ -281,7 +386,9 @@ export class WorldEngine {
     this.buildWildlifeAndParticles();
     this.syncBuildingsToScene();
     this.syncProjectsToScene();
+    this.updateFrontierChunks(true);
     this.updateTerrainVitalityColors();
+    this.evaluateAchievements(false);
     this.bindEvents();
 
     if (!this.isSoftwareGl) {
@@ -298,13 +405,30 @@ export class WorldEngine {
       const raw = localStorage.getItem(SAVE_KEY);
       if (!raw) return createFreshState();
       const parsed = JSON.parse(raw) as Partial<GameState>;
-      const base = createFreshState();
+      const base = createFreshState(
+        typeof parsed.worldSeed === 'number' ? parsed.worldSeed : 104729,
+        typeof parsed.seedLabel === 'string' ? parsed.seedLabel : String(parsed.worldSeed || 104729),
+        parsed.biomePreset && BIOME_PRESETS[parsed.biomePreset] ? parsed.biomePreset : 'verdant',
+      );
       return {
         ...base,
         ...parsed,
         inv: { ...base.inv, ...(parsed.inv || {}) },
         npcMemories: { ...base.npcMemories, ...(parsed.npcMemories || {}) },
         communityProjects: { ...base.communityProjects, ...(parsed.communityProjects || {}) },
+        unlockedAchievements:
+          parsed.unlockedAchievements && typeof parsed.unlockedAchievements === 'object'
+            ? parsed.unlockedAchievements
+            : {},
+        visitedZones: Array.isArray(parsed.visitedZones) && parsed.visitedZones.length > 0
+          ? (parsed.visitedZones as ZoneId[])
+          : ['plaza'],
+        pulsesTriggered: typeof parsed.pulsesTriggered === 'number' ? parsed.pulsesTriggered : 0,
+        purifiedBlightIds: Array.isArray(parsed.purifiedBlightIds) ? parsed.purifiedBlightIds : [],
+        blightPurified: typeof parsed.blightPurified === 'number' ? parsed.blightPurified : 0,
+        health: typeof parsed.health === 'number' ? Math.max(0, Math.min(100, parsed.health)) : 100,
+        collapseTimer: typeof parsed.collapseTimer === 'number' ? parsed.collapseTimer : 0,
+        gameOver: parsed.gameOver ?? null,
         buildings: Array.isArray(parsed.buildings) ? parsed.buildings : [],
         discoveredSecrets: Array.isArray(parsed.discoveredSecrets) ? parsed.discoveredSecrets : [],
         ruinPillars: Array.isArray(parsed.ruinPillars) && parsed.ruinPillars.length === 3 ? parsed.ruinPillars : [false, false, false],
@@ -401,6 +525,19 @@ export class WorldEngine {
     this.sunLight.shadow.normalBias = 0.025;
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
+    this.scene.add(this.staticPropsGroup);
+    this.scene.add(this.cloudGroup);
+
+    if (!this.isSoftwareGl) {
+      const composer = new EffectComposer(this.renderer);
+      composer.setSize(w, h);
+      composer.addPass(new RenderPass(this.scene, this.camera));
+      const bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.34, 0.45, 0.85);
+      composer.addPass(bloomPass);
+      composer.addPass(new OutputPass());
+      this.composer = composer;
+      this.bloomPass = bloomPass;
+    }
 
     this.scene.add(this.synergyArcsGroup);
 
@@ -418,20 +555,89 @@ export class WorldEngine {
     this.walkWaypointMesh.visible = false;
     this.scene.add(this.walkWaypointMesh);
 
-    // Resonance pulse ring
+    // Resonance pulse custom shader ground wavefront & volumetric dome
     this.pulseRing = new THREE.Mesh(
-      new THREE.RingGeometry(0.6, 1.0, 48),
-      new THREE.MeshBasicMaterial({
-        color: 0xc9a6ff,
-        side: THREE.DoubleSide,
+      new THREE.RingGeometry(0.45, 1.0, 64),
+      new THREE.ShaderMaterial({
         transparent: true,
-        opacity: 0.75,
         depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uAge: { value: 0 },
+          uColorA: { value: new THREE.Color(0x7ef2c9) },
+          uColorB: { value: new THREE.Color(0xc9a6ff) },
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          varying vec3 vPos;
+          void main() {
+            vUv = uv;
+            vPos = position;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform float uAge;
+          uniform vec3 uColorA;
+          uniform vec3 uColorB;
+          varying vec2 vUv;
+          varying vec3 vPos;
+          void main() {
+            float r = length(vPos.xy);
+            float rim = smoothstep(0.45, 0.92, r) * (1.0 - smoothstep(0.92, 1.0, r));
+            float inner = exp(-pow((r - 0.68) * 9.0, 2.0)) * 0.7;
+            float fade = 1.0 - smoothstep(1.2, 2.3, uAge);
+            vec3 col = mix(uColorA, uColorB, rim);
+            gl_FragColor = vec4(col, (rim + inner) * fade * 0.85);
+          }
+        `,
       }),
     );
     this.pulseRing.rotation.x = -Math.PI / 2;
     this.pulseRing.visible = false;
     this.scene.add(this.pulseRing);
+
+    this.pulseDome = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 36, 20, 0, Math.PI * 2, 0, Math.PI * 0.5),
+      new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uAge: { value: 0 },
+          uColor: { value: new THREE.Color(0xc9a6ff) },
+        },
+        vertexShader: `
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          varying float vHeight;
+          void main() {
+            vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+            vNormal = normalize(normalMatrix * normal);
+            vViewDir = normalize(-mvPos.xyz);
+            vHeight = position.y;
+            gl_Position = projectionMatrix * mvPos;
+          }
+        `,
+        fragmentShader: `
+          uniform float uAge;
+          uniform vec3 uColor;
+          varying vec3 vNormal;
+          varying vec3 vViewDir;
+          varying float vHeight;
+          void main() {
+            float fresnel = pow(1.0 - abs(dot(normalize(vNormal), normalize(vViewDir))), 2.2);
+            float scan = 0.65 + 0.35 * sin(vHeight * 24.0 - uAge * 10.0);
+            float fade = (1.0 - smoothstep(0.7, 2.2, uAge)) * smoothstep(0.0, 0.14, vHeight);
+            gl_FragColor = vec4(uColor, fresnel * scan * fade * 0.55);
+          }
+        `,
+      }),
+    );
+    this.pulseDome.visible = false;
+    this.scene.add(this.pulseDome);
 
     // Build placement ring
     this.ghostRing = new THREE.Mesh(
@@ -449,9 +655,87 @@ export class WorldEngine {
     this.scene.add(this.ghostRing);
   }
 
+  private applyPulseShaderToTerrainMat(mat: THREE.MeshStandardMaterial): void {
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uPulseOrigin = this.pulseUniforms.uOrigin;
+      shader.uniforms.uPulseTime = this.pulseUniforms.uTime;
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <common>',
+        `#include <common>
+         varying vec3 vPulseWorldPos;`,
+      );
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+         vPulseWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`,
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <common>',
+        `#include <common>
+         uniform vec3 uPulseOrigin;
+         uniform float uPulseTime;
+         varying vec3 vPulseWorldPos;`,
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <emissivemap_fragment>',
+        `#include <emissivemap_fragment>
+         if (uPulseTime >= 0.0 && uPulseTime < 2.4) {
+           float pDist = distance(vPulseWorldPos.xz, uPulseOrigin.xz);
+           float waveR = uPulseTime * 24.0;
+           float ring1 = exp(-pow((pDist - waveR) * 0.65, 2.0));
+           float ring2 = exp(-pow((pDist - (waveR - 6.0)) * 0.9, 2.0)) * 0.55;
+           float fade = (1.0 - smoothstep(1.3, 2.4, uPulseTime)) * (1.0 - smoothstep(38.0, 50.0, pDist));
+           float grid = smoothstep(0.88, 1.0, abs(sin(vPulseWorldPos.x * 0.85))) + smoothstep(0.88, 1.0, abs(sin(vPulseWorldPos.z * 0.85)));
+           float topo = smoothstep(0.91, 1.0, abs(sin(vPulseWorldPos.y * 3.1)));
+           float wake = smoothstep(waveR - 14.0, waveR, pDist) * (1.0 - smoothstep(waveR, waveR + 1.0, pDist));
+           vec3 pulseCol = mix(vec3(0.49, 0.95, 0.79), vec3(0.79, 0.65, 1.0), 0.55);
+           totalEmissiveRadiance += pulseCol * (ring1 * 1.45 + ring2 * 0.75 + wake * (grid * 0.16 + topo * 0.22)) * fade;
+         }`,
+      );
+    };
+  }
+
+  private sampleBaseTerrainColor(x: number, z: number, y: number, out: THREE.Color): void {
+    const biome = BIOME_PRESETS[this.state.biomePreset];
+    const distRiver = Math.abs(x - riverCenterX(z)) - riverHalfWidth(z);
+    const onTerrace = Math.hypot(x + 62, z - 54) < 30;
+    const inRuins = Math.hypot(x + 66, z + 62) < 20;
+    const inCavern = Math.hypot(x - 72, z + 68) < 22;
+    const inPlaza = Math.hypot(x + 15, z) < 15;
+    const slope = terrainSlopeAt(x, z);
+
+    if (y < WATER_LEVEL + 0.12) {
+      out.setHex(0x4b635a);
+    } else if (distRiver < 2.3) {
+      out.setHex(0x8c876c);
+    } else if (inCavern) {
+      out.setHex(0x46515b);
+    } else if (inRuins) {
+      out.setHex(0x737e77);
+    } else if (inPlaza) {
+      out.setHex(0x8b8669);
+    } else if (onTerrace && this.state.biomePreset === 'verdant') {
+      out.setHex(0xb99162);
+    } else if (x > 26 && Math.hypot(x, z) < 120) {
+      out.setHex(biome.forestHex);
+    } else {
+      out.setHex(biome.grassHex);
+    }
+
+    // Blend steep rocky cliffs & high ridges into weathered stone strata
+    if (slope > 0.45 || y > 5.5) {
+      const rockMix = Math.min(0.88, Math.max((slope - 0.45) * 1.15, (y - 5.5) * 0.12));
+      _colC.setHex(biome.rockHex);
+      out.lerp(_colC, rockMix);
+    }
+
+    const shade = 0.92 + Math.min(0.18, Math.max(-0.1, y * 0.025));
+    out.multiplyScalar(shade);
+  }
+
   private buildTerrain(): void {
-    const size = WORLD_HALF * 2;
-    const segs = 152;
+    const size = 240; // Exact 2.0m vertex grid matching CHUNK_SIZE=80 / 40 segs for zero-seam tiling
+    const segs = 120;
     const geo = new THREE.PlaneGeometry(size, size, segs, segs);
     geo.rotateX(-Math.PI / 2);
 
@@ -463,37 +747,10 @@ export class WorldEngine {
       const z = pos.getZ(i);
       const y = groundHeightAt(x, z);
       pos.setY(i, y);
-
-      // Base biome vertex color
-      const distRiver = Math.abs(x - riverCenterX(z)) - riverHalfWidth(z);
-      const onTerrace = Math.hypot(x + 62, z - 54) < 30;
-      const inRuins = Math.hypot(x + 66, z + 62) < 20;
-      const inCavern = Math.hypot(x - 72, z + 68) < 22;
-      const inPlaza = Math.hypot(x + 15, z) < 15;
-
-      if (y < WATER_LEVEL + 0.12) {
-        _colA.setHex(0x4b635a); // riverbed stones
-      } else if (distRiver < 2.2) {
-        _colA.setHex(0x888367); // sandy riverbank
-      } else if (inCavern) {
-        _colA.setHex(0x46515b); // dark cavern basalt
-      } else if (inRuins) {
-        _colA.setHex(0x737e77); // slate courtyard
-      } else if (inPlaza) {
-        _colA.setHex(0x8b8669); // packed cobblestone earth
-      } else if (onTerrace) {
-        _colA.setHex(0xb99162); // dry terracotta clay (heals with irrigators!)
-      } else if (x > 26) {
-        _colA.setHex(0x33664b); // deep forest moss
-      } else {
-        _colA.setHex(0x478052); // lush valley grass
-      }
-
-      // Subtle height shading
-      const shade = 0.92 + Math.min(0.18, Math.max(-0.1, y * 0.03));
-      colors[i * 3] = _colA.r * shade;
-      colors[i * 3 + 1] = _colA.g * shade;
-      colors[i * 3 + 2] = _colA.b * shade;
+      this.sampleBaseTerrainColor(x, z, y, _colA);
+      colors[i * 3] = _colA.r;
+      colors[i * 3 + 1] = _colA.g;
+      colors[i * 3 + 2] = _colA.b;
     }
 
     this.baseTerrainColors = new Float32Array(colors);
@@ -503,9 +760,12 @@ export class WorldEngine {
     const mat = new THREE.MeshStandardMaterial({
       vertexColors: true,
       map: this.tex.terrainDetail,
-      roughness: 0.92,
+      normalMap: this.tex.terrainNormal,
+      normalScale: new THREE.Vector2(0.85, 0.85),
+      roughness: 0.91,
       metalness: 0.02,
     });
+    this.applyPulseShaderToTerrainMat(mat);
 
     this.terrainGeo = geo;
     this.terrainMesh = new THREE.Mesh(geo, mat);
@@ -518,36 +778,55 @@ export class WorldEngine {
     const colAttr = this.terrainGeo.attributes.color as THREE.BufferAttribute;
     const arr = colAttr.array as Float32Array;
     const irrigators = this.state.buildings.filter((b) => b.type === 'irrigator');
+    const activeBlights = Array.from(this.blightNodes.values()).filter((bn) => !bn.purified);
 
     for (let i = 0; i < pos.count; i++) {
       let r = this.baseTerrainColors[i * 3];
       let g = this.baseTerrainColors[i * 3 + 1];
       let b = this.baseTerrainColors[i * 3 + 2];
+      const x = pos.getX(i);
+      const z = pos.getZ(i);
+      const y = pos.getY(i);
 
-      if (irrigators.length > 0) {
-        const x = pos.getX(i);
-        const z = pos.getZ(i);
-        const y = pos.getY(i);
-        if (y > WATER_LEVEL + 0.1) {
-          let maxBloom = 0;
-          for (const irr of irrigators) {
-            const radius = irr.tier === 3 ? 34 : irr.tier === 2 ? 25 : 17;
-            const d = Math.hypot(x - irr.x, z - irr.z);
-            if (d < radius) {
-              const strength = (1 - d / radius) * Math.max(0.35, irr.growth);
-              if (strength > maxBloom) maxBloom = strength;
-            }
-          }
-          if (maxBloom > 0.01) {
-            _colA.setRGB(r, g, b);
-            _colB.setHex(0x4ea35c);
-            _colA.lerp(_colB, Math.min(0.92, maxBloom * 1.15));
-            r = _colA.r;
-            g = _colA.g;
-            b = _colA.b;
+      if (irrigators.length > 0 && y > WATER_LEVEL + 0.1) {
+        let maxBloom = 0;
+        for (const irr of irrigators) {
+          const radius = irr.tier === 3 ? 34 : irr.tier === 2 ? 25 : 17;
+          const d = Math.hypot(x - irr.x, z - irr.z);
+          if (d < radius) {
+            const strength = (1 - d / radius) * Math.max(0.35, irr.growth);
+            if (strength > maxBloom) maxBloom = strength;
           }
         }
+        if (maxBloom > 0.01) {
+          _colA.setRGB(r, g, b);
+          _colB.setHex(0x4ea35c);
+          _colA.lerp(_colB, Math.min(0.92, maxBloom * 1.15));
+          r = _colA.r;
+          g = _colA.g;
+          b = _colA.b;
+        }
       }
+
+      if (activeBlights.length > 0 && y > WATER_LEVEL + 0.05) {
+        let maxCorrupt = 0;
+        for (const bn of activeBlights) {
+          const d = Math.hypot(x - bn.x, z - bn.z);
+          if (d < bn.radius * 1.55) {
+            const k = 1 - d / (bn.radius * 1.55);
+            if (k > maxCorrupt) maxCorrupt = k;
+          }
+        }
+        if (maxCorrupt > 0.02) {
+          _colA.setRGB(r, g, b);
+          _colB.setHex(0x2d1c3d);
+          _colA.lerp(_colB, Math.min(0.85, maxCorrupt * 0.95));
+          r = _colA.r;
+          g = _colA.g;
+          b = _colA.b;
+        }
+      }
+
       arr[i * 3] = r;
       arr[i * 3 + 1] = g;
       arr[i * 3 + 2] = b;
@@ -557,22 +836,25 @@ export class WorldEngine {
   }
 
   private buildWaterAndWaterfall(): void {
-    // Main continuous reflective water plane at WATER_LEVEL
-    const waterGeo = new THREE.PlaneGeometry(WORLD_HALF * 2, WORLD_HALF * 2, 72, 72);
+    // Boundless player-centered reflective water surface using world-space waves & shoreline froth
+    const waterGeo = new THREE.PlaneGeometry(360, 360, 88, 88);
     waterGeo.rotateX(-Math.PI / 2);
 
+    const biome = BIOME_PRESETS[this.state.biomePreset];
     const waterMat = new THREE.MeshPhysicalMaterial({
-      color: 0x2c8da1,
-      roughness: 0.14,
-      metalness: 0.08,
-      clearcoat: 0.85,
-      clearcoatRoughness: 0.16,
+      color: biome.waterHex,
+      roughness: 0.12,
+      metalness: 0.1,
+      clearcoat: 0.9,
+      clearcoatRoughness: 0.14,
       transparent: true,
-      opacity: 0.84,
+      opacity: 0.85,
     });
 
     waterMat.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.waterUniforms.uTime;
+      shader.uniforms.uPulseOrigin = this.pulseUniforms.uOrigin;
+      shader.uniforms.uPulseTime = this.pulseUniforms.uTime;
       shader.vertexShader = shader.vertexShader.replace(
         '#include <common>',
         `#include <common>
@@ -582,28 +864,45 @@ export class WorldEngine {
       shader.vertexShader = shader.vertexShader.replace(
         '#include <begin_vertex>',
         `#include <begin_vertex>
-         transformed.y += sin(transformed.x * 0.6 + uTime * 2.1) * 0.045
-                        + cos(transformed.z * 0.45 - uTime * 2.8) * 0.055;
+         vec4 worldTemp = modelMatrix * vec4(transformed, 1.0);
+         transformed.y += sin(worldTemp.x * 0.55 + uTime * 2.1) * 0.048
+                        + cos(worldTemp.z * 0.42 - uTime * 2.8) * 0.058
+                        + sin((worldTemp.x + worldTemp.z) * 0.9 + uTime * 3.4) * 0.022;
          vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`,
       );
       shader.fragmentShader = shader.fragmentShader.replace(
         '#include <common>',
         `#include <common>
          uniform float uTime;
+         uniform vec3 uPulseOrigin;
+         uniform float uPulseTime;
          varying vec3 vWPos;`,
       );
       shader.fragmentShader = shader.fragmentShader.replace(
         '#include <color_fragment>',
         `#include <color_fragment>
-         float ripple = sin(vWPos.z * 1.3 - uTime * 3.4 + sin(vWPos.x * 0.9) * 2.0);
-         diffuseColor.rgb += vec3(0.06, 0.14, 0.16) * smoothstep(0.45, 1.0, ripple);`,
+         float ripple1 = sin(vWPos.z * 1.25 - uTime * 3.2 + sin(vWPos.x * 0.85) * 2.1);
+         float ripple2 = cos(vWPos.x * 1.6 + vWPos.z * 0.7 - uTime * 2.4);
+         float caustic = smoothstep(0.45, 1.0, ripple1 * 0.6 + ripple2 * 0.4);
+         diffuseColor.rgb += vec3(0.08, 0.17, 0.2) * caustic;`,
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <emissivemap_fragment>',
+        `#include <emissivemap_fragment>
+         if (uPulseTime >= 0.0 && uPulseTime < 2.4) {
+           float pDist = distance(vWPos.xz, uPulseOrigin.xz);
+           float waveR = uPulseTime * 24.0;
+           float ring = exp(-pow((pDist - waveR) * 0.72, 2.0));
+           float fade = (1.0 - smoothstep(1.3, 2.4, uPulseTime)) * (1.0 - smoothstep(38.0, 50.0, pDist));
+           totalEmissiveRadiance += vec3(0.55, 0.92, 1.0) * ring * fade * 1.35;
+         }`,
       );
     };
 
-    const waterMesh = new THREE.Mesh(waterGeo, waterMat);
-    waterMesh.position.y = WATER_LEVEL;
-    waterMesh.receiveShadow = true;
-    this.scene.add(waterMesh);
+    this.waterMesh = new THREE.Mesh(waterGeo, waterMat);
+    this.waterMesh.position.y = WATER_LEVEL;
+    this.waterMesh.receiveShadow = true;
+    this.scene.add(this.waterMesh);
 
     // Stepping stones at southern ford (z = FORD_Z)
     const stoneMat = new THREE.MeshStandardMaterial({
@@ -662,10 +961,33 @@ export class WorldEngine {
     fallSheet.rotation.y = -Math.PI * 0.35;
     fallSheet.rotation.x = 0.18;
     this.scene.add(fallSheet);
+
+    // Waterfall Splash Mist Particle Plume
+    const mistCount = 64;
+    const mistPos = new Float32Array(mistCount * 3);
+    for (let i = 0; i < mistCount; i++) {
+      mistPos[i * 3] = 71.5 + (Math.random() - 0.5) * 4.5;
+      mistPos[i * 3 + 1] = WATER_LEVEL + Math.random() * 2.8;
+      mistPos[i * 3 + 2] = 45.2 + (Math.random() - 0.5) * 4.5;
+    }
+    const mistGeo = new THREE.BufferGeometry();
+    mistGeo.setAttribute('position', new THREE.BufferAttribute(mistPos, 3));
+    this.waterfallMistPoints = new THREE.Points(
+      mistGeo,
+      new THREE.PointsMaterial({
+        map: this.tex.cloudPuff,
+        color: 0xdff8ff,
+        size: 3.2,
+        transparent: true,
+        opacity: 0.42,
+        depthWrite: false,
+      }),
+    );
+    this.scene.add(this.waterfallMistPoints);
   }
 
   private buildSkyAndAtmosphere(): void {
-    const skyGeo = new THREE.SphereGeometry(260, 24, 16);
+    const skyGeo = new THREE.SphereGeometry(320, 24, 16);
     const skyMat = new THREE.MeshBasicMaterial({
       color: 0x7cb3cf,
       side: THREE.BackSide,
@@ -701,13 +1023,41 @@ export class WorldEngine {
     );
     this.scene.add(this.moonDisc);
 
+    // Procedural Drifting 3D Sky Cloud Clusters
+    const cloudMat = new THREE.SpriteMaterial({
+      map: this.tex.cloudPuff,
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.65,
+      depthWrite: false,
+      fog: false,
+    });
+    const rng = createSeededRng(this.state.worldSeed + 41);
+    for (let i = 0; i < 16; i++) {
+      const cluster = new THREE.Group();
+      const angle = (i / 16) * TAU + rng() * 0.3;
+      const dist = 75 + rng() * 145;
+      cluster.position.set(Math.cos(angle) * dist, 52 + rng() * 26, Math.sin(angle) * dist);
+      cluster.userData.baseOffset = cluster.position.clone();
+      cluster.userData.speed = 1.4 + rng() * 1.6;
+      const puffs = 3 + Math.floor(rng() * 3);
+      for (let p = 0; p < puffs; p++) {
+        const sp = new THREE.Sprite(cloudMat);
+        sp.position.set((p - 1.5) * 6.5, (rng() - 0.5) * 2.2, (rng() - 0.5) * 4.5);
+        const sx = 18 + rng() * 14;
+        sp.scale.set(sx, sx * 0.55, 1);
+        cluster.add(sp);
+      }
+      this.cloudGroup.add(cluster);
+    }
+
     // Starfield for dusk & night
-    const starCount = 450;
+    const starCount = 520;
     const starPos = new Float32Array(starCount * 3);
     for (let i = 0; i < starCount; i++) {
       const theta = Math.random() * TAU;
       const phi = Math.random() * Math.PI * 0.44;
-      const r = 230;
+      const r = 270;
       starPos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
       starPos[i * 3 + 1] = r * Math.cos(phi) + 12;
       starPos[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
@@ -718,7 +1068,7 @@ export class WorldEngine {
       starGeo,
       new THREE.PointsMaterial({
         color: 0xe6f4ff,
-        size: 1.5,
+        size: 1.6,
         transparent: true,
         opacity: 0,
         fog: false,
@@ -728,6 +1078,11 @@ export class WorldEngine {
   }
 
   private buildStaticWorld(): void {
+    this.staticObstacles = [];
+    this.cottageWindowMats = [];
+    this.ruinPillarMeshes = [];
+    this.pulseHighlights = this.pulseHighlights.filter((h) => h.kind !== 'pillar');
+
     // 1. Village Cottages around Central Plaza
     const cottages: Array<{ x: number; z: number; rot: number; scale: number }> = [
       { x: -24, z: -13, rot: 0.45, scale: 1.05 },
@@ -746,22 +1101,28 @@ export class WorldEngine {
           }
         }
       });
-      this.scene.add(mesh);
+      this.staticPropsGroup.add(mesh);
       this.staticObstacles.push({ x: c.x, z: c.z, r: 4.1 * c.scale });
     });
 
     // Central Plaza Compass Medallion
     const compassStone = new THREE.Mesh(
       new THREE.CylinderGeometry(4.6, 4.9, 0.22, 16),
-      new THREE.MeshStandardMaterial({ map: this.tex.stone, color: 0x8e9994, roughness: 0.85 }),
+      new THREE.MeshStandardMaterial({
+        map: this.tex.stone,
+        normalMap: this.tex.stoneNormal,
+        color: 0x8e9994,
+        roughness: 0.85,
+      }),
     );
     compassStone.position.set(-15, groundHeightAt(-15, 0) + 0.05, 0);
     compassStone.receiveShadow = true;
-    this.scene.add(compassStone);
+    this.staticPropsGroup.add(compassStone);
 
     // 2. Echo Cavern (Northeast: 72, -68) — overarching basalt cliff formation + stalactites + mist
     const rockMat = new THREE.MeshStandardMaterial({
       map: this.tex.stone,
+      normalMap: this.tex.stoneNormal,
       color: 0x4b5762,
       roughness: 0.92,
     });
@@ -777,7 +1138,7 @@ export class WorldEngine {
       m.scale.set(1.1, sy, 1.1);
       m.castShadow = true;
       m.receiveShadow = true;
-      this.scene.add(m);
+      this.staticPropsGroup.add(m);
       this.staticObstacles.push({ x: rx, z: rz, r: rad * 0.72 });
     });
     // Overhanging cavern roof canopy
@@ -785,7 +1146,7 @@ export class WorldEngine {
     caveRoof.position.set(73, 8.2, -71);
     caveRoof.scale.set(1.45, 0.48, 1.35);
     caveRoof.castShadow = true;
-    this.scene.add(caveRoof);
+    this.staticPropsGroup.add(caveRoof);
 
     // Glowing crystals inside Echo Cavern
     const crystalMat = new THREE.MeshStandardMaterial({
@@ -801,12 +1162,12 @@ export class WorldEngine {
       const shard = new THREE.Mesh(new THREE.ConeGeometry(0.65, 2.8 + (i % 3), 5), crystalMat);
       shard.position.set(cx, groundHeightAt(cx, cz) + 1.1, cz);
       shard.rotation.z = (i - 2.5) * 0.2;
-      this.scene.add(shard);
+      this.staticPropsGroup.add(shard);
     }
 
     this.cavernLight = new THREE.PointLight(0x88e9ff, this.state.cavernLit ? 3.5 : 0.4, 28, 1.5);
     this.cavernLight.position.set(72, 4.5, -68);
-    this.scene.add(this.cavernLight);
+    this.staticPropsGroup.add(this.cavernLight);
 
     this.cavernMistMesh = new THREE.Mesh(
       new THREE.SphereGeometry(11, 16, 12),
@@ -819,16 +1180,16 @@ export class WorldEngine {
     );
     this.cavernMistMesh.position.set(70, 3.2, -64);
     this.cavernMistMesh.visible = !this.state.cavernLit;
-    this.scene.add(this.cavernMistMesh);
+    this.staticPropsGroup.add(this.cavernMistMesh);
 
     // 3. Sunken Ruins (Northwest: -66, -62) — 3 Interactive Rune Pillars + Sundial Altar
     const altar = new THREE.Mesh(
       new THREE.CylinderGeometry(3.2, 3.8, 0.7, 8),
-      new THREE.MeshStandardMaterial({ map: this.tex.stone, color: 0x778380, roughness: 0.88 }),
+      new THREE.MeshStandardMaterial({ map: this.tex.stone, normalMap: this.tex.stoneNormal, color: 0x778380, roughness: 0.88 }),
     );
     altar.position.set(-66, groundHeightAt(-66, -62) + 0.35, -62);
     altar.receiveShadow = true;
-    this.scene.add(altar);
+    this.staticPropsGroup.add(altar);
 
     const pillarOffsets: [number, number][] = [
       [-74, -56],
@@ -845,45 +1206,76 @@ export class WorldEngine {
         mat.emissiveIntensity = 1.6;
       }
       this.ruinPillarMeshes.push(pillar);
-      this.scene.add(pillar);
+      this.staticPropsGroup.add(pillar);
       this.staticObstacles.push({ x: px, z: pz, r: 1.4 });
+      this.registerPulseHighlight(
+        `pillar_${idx}`,
+        'pillar',
+        pillar,
+        0xc9a6ff,
+        1.5,
+        6.2,
+        () => ({ x: px, z: pz }),
+        () => !this.state.ruinPillars[idx],
+      );
     });
 
-    // 4. Trees across valley (avoiding paths, water, plazas, and landmarks)
-    let treeSeed = 918273;
-    const trnd = () => {
-      treeSeed = (treeSeed * 1664525 + 1013904223) >>> 0;
-      return treeSeed / 4294967296;
-    };
+    // 4. Trees across valley (seeded per world, avoiding paths, water, plazas, and landmarks)
+    const trnd = createSeededRng(this.state.worldSeed + 918273);
+    const biome = BIOME_PRESETS[this.state.biomePreset];
     let placedTrees = 0;
-    for (let i = 0; i < 420 && placedTrees < 92; i++) {
-      const tx = (trnd() - 0.5) * 195;
-      const tz = (trnd() - 0.5) * 195;
+    const maxTrees = this.state.biomePreset === 'arid_winds' ? 56 : 96;
+    for (let i = 0; i < 420 && placedTrees < maxTrees; i++) {
+      const tx = (trnd() - 0.5) * 205;
+      const tz = (trnd() - 0.5) * 205;
       const y = groundHeightAt(tx, tz);
       if (y < WATER_LEVEL + 0.7) continue;
-      if (terrainSlopeAt(tx, tz) > 0.45) continue;
-      if (Math.hypot(tx + 15, tz) < 22) continue; // Plaza
-      if (Math.hypot(tx + 66, tz + 62) < 18) continue; // Ruins
-      if (Math.hypot(tx - 72, tz + 68) < 22) continue; // Cavern
-      if (Math.hypot(tx + 62, tz - 54) < 25) continue; // Dry Terrace (keep dry/open!)
-      if (Math.hypot(tx - 56, tz - 50) < 9) continue; // Island center
+      if (terrainSlopeAt(tx, tz) > 0.48) continue;
+      if (Math.hypot(tx + 15, tz) < 22) continue;
+      if (Math.hypot(tx + 66, tz + 62) < 18) continue;
+      if (Math.hypot(tx - 72, tz + 68) < 22) continue;
+      if (Math.hypot(tx + 62, tz - 54) < 25) continue;
+      if (Math.hypot(tx - 56, tz - 50) < 9) continue;
       if (Math.abs(tx - riverCenterX(tz)) < riverHalfWidth(tz) + 5) continue;
       if (this.staticObstacles.some((o) => Math.hypot(tx - o.x, tz - o.z) < o.r + 3.2)) continue;
       if (NPCS_BASE.some((n) => Math.hypot(tx - n.homeX, tz - n.homeZ) < 6.5)) continue;
 
       const kind =
-        tx > 28 ? (trnd() > 0.45 ? 'glowwillow' : 'pine') : trnd() > 0.5 ? 'oak' : 'pine';
-      const scale = 0.85 + trnd() * 0.55;
+        tx > 28 || this.state.biomePreset === 'mystic_night'
+          ? trnd() > 0.4
+            ? 'glowwillow'
+            : 'pine'
+          : trnd() > 0.5
+            ? 'oak'
+            : 'pine';
+      const scale = 0.85 + trnd() * 0.58;
       const tree = createTreeGroup(kind, this.tex, scale);
       tree.position.set(tx, y - 0.1, tz);
       tree.rotation.y = trnd() * TAU;
-      this.scene.add(tree);
+      this.staticPropsGroup.add(tree);
       this.staticObstacles.push({ x: tx, z: tz, r: 0.9 * scale });
       placedTrees++;
     }
 
-    // 5. Instanced Swaying Grass Blades (1,300 blades)
-    const grassCount = 1300;
+    // Rock boulders along central hillsides for 3D depth
+    for (let i = 0; i < 24; i++) {
+      const bx = (trnd() - 0.5) * 205;
+      const bz = (trnd() - 0.5) * 205;
+      const by = groundHeightAt(bx, bz);
+      if (by < WATER_LEVEL + 0.4) continue;
+      if (Math.hypot(bx + 15, bz) < 20) continue;
+      if (Math.abs(bx - riverCenterX(bz)) < riverHalfWidth(bz) + 4) continue;
+      if (this.staticObstacles.some((o) => Math.hypot(bx - o.x, bz - o.z) < o.r + 2.8)) continue;
+      const boulder = createBoulderClusterGroup(this.tex, biome.rockHex);
+      boulder.position.set(bx, by - 0.15, bz);
+      boulder.rotation.y = trnd() * TAU;
+      boulder.scale.setScalar(0.8 + trnd() * 0.7);
+      this.staticPropsGroup.add(boulder);
+      this.staticObstacles.push({ x: bx, z: bz, r: 1.6 });
+    }
+
+    // 5. Instanced Swaying Grass Blades (1,450 blades)
+    const grassCount = 1450;
     const bladeGeo = new THREE.ConeGeometry(0.11, 0.82, 3);
     bladeGeo.translate(0, 0.41, 0);
     const bladeMat = new THREE.MeshStandardMaterial({
@@ -908,20 +1300,20 @@ export class WorldEngine {
 
     const grassMesh = new THREE.InstancedMesh(bladeGeo, bladeMat, grassCount);
     let gCount = 0;
-    for (let i = 0; i < 3200 && gCount < grassCount; i++) {
-      const gx = (trnd() - 0.5) * 185;
-      const gz = (trnd() - 0.5) * 185;
+    for (let i = 0; i < 3600 && gCount < grassCount; i++) {
+      const gx = (trnd() - 0.5) * 205;
+      const gz = (trnd() - 0.5) * 205;
       const gy = groundHeightAt(gx, gz);
       if (gy < WATER_LEVEL + 0.35) continue;
-      if (Math.hypot(gx + 62, gz - 54) < 24) continue; // Keep dry terrace sparse
+      if (Math.hypot(gx + 62, gz - 54) < 24 && this.state.biomePreset === 'verdant') continue;
       if (Math.hypot(gx - 72, gz + 68) < 14) continue;
       _dummy.position.set(gx, gy - 0.05, gz);
       _dummy.rotation.set(0, trnd() * TAU, 0);
-      const s = 0.75 + trnd() * 0.75;
+      const s = 0.75 + trnd() * 0.8;
       _dummy.scale.set(s, s, s);
       _dummy.updateMatrix();
       grassMesh.setMatrixAt(gCount, _dummy.matrix);
-      _colA.setHex(gx > 26 ? 0x3b7b5b : 0x569658).offsetHSL(0, 0, (trnd() - 0.5) * 0.08);
+      _colA.setHex(gx > 26 ? biome.forestHex : biome.grassHex).offsetHSL(0, 0, 0.06 + (trnd() - 0.5) * 0.09);
       grassMesh.setColorAt(gCount, _colA);
       gCount++;
     }
@@ -929,7 +1321,7 @@ export class WorldEngine {
     grassMesh.instanceMatrix.needsUpdate = true;
     if (grassMesh.instanceColor) grassMesh.instanceColor.needsUpdate = true;
     grassMesh.computeBoundingSphere();
-    this.scene.add(grassMesh);
+    this.staticPropsGroup.add(grassMesh);
   }
 
   private buildPlayerAndNpcs(): void {
@@ -968,6 +1360,24 @@ export class WorldEngine {
         yaw: 0,
         phase: Math.random() * TAU,
       });
+      this.npcPatrolStates.set(npc.id, {
+        stopIdx: 0,
+        pauseTimer: 2.0,
+        activity: NPC_PATROL_ROUTES[npc.id][0]?.activity || 'מסייר בעמק',
+      });
+      this.registerPulseHighlight(
+        `npc_${npc.id}`,
+        'npc',
+        rig.group,
+        0xf5b971,
+        0.9,
+        2.4,
+        () => {
+          const entry = this.npcRigs.get(npc.id);
+          return { x: entry?.x ?? npc.homeX, z: entry?.z ?? npc.homeZ };
+        },
+        () => true,
+      );
     }
   }
 
@@ -1014,6 +1424,16 @@ export class WorldEngine {
       mesh.visible = !hidden;
       this.resourceMeshes.set(node.id, mesh);
       this.scene.add(mesh);
+      this.registerPulseHighlight(
+        node.id,
+        'resource',
+        mesh,
+        0x7ef2c9,
+        0.95,
+        2.6,
+        () => ({ x, z }),
+        () => node.active,
+      );
     });
 
     // Secret Shrine / Relic Pedestals
@@ -1042,7 +1462,359 @@ export class WorldEngine {
       grp.add(base, orb);
       this.secretMeshes.set(sec.id, grp);
       this.scene.add(grp);
+      this.registerPulseHighlight(
+        sec.id,
+        'secret',
+        grp,
+        0xffcb77,
+        1.5,
+        5.8,
+        () => ({ x: sec.x, z: sec.z }),
+        () => !this.state.discoveredSecrets.includes(sec.id),
+      );
     }
+
+    // Central Valley Blight Nests (create tense survival stakes right outside safe Plaza)
+    for (const spot of VALLEY_BLIGHT_SPOTS) {
+      this.spawnBlightNode(spot.id, spot.x, spot.z, spot.hp, spot.radius);
+    }
+  }
+
+  private spawnBlightNode(
+    id: string,
+    x: number,
+    z: number,
+    maxHp: number,
+    radius: number,
+    chunkKey?: string,
+  ): void {
+    if (this.blightNodes.has(id)) return;
+    const purified = this.state.purifiedBlightIds.includes(id);
+    const grp = createBlightNestGroup(this.tex, purified);
+    grp.position.set(x, groundHeightAt(x, z), z);
+    this.scene.add(grp);
+
+    const node: BlightNodeState & { group: THREE.Group } = {
+      id,
+      x,
+      z,
+      hp: purified ? 0 : maxHp,
+      maxHp,
+      purified,
+      radius,
+      chunkKey,
+      group: grp,
+    };
+    this.blightNodes.set(id, node);
+    this.registerPulseHighlight(
+      `blight_${id}`,
+      'blight',
+      grp,
+      0xff5c9d,
+      2.2,
+      4.8,
+      () => ({ x, z }),
+      () => !node.purified,
+    );
+  }
+
+  private disposeObjectTree(root: THREE.Object3D): void {
+    root.traverse((obj) => {
+      const m = obj as THREE.Mesh;
+      if (m.geometry) m.geometry.dispose();
+      if (m.material) {
+        const mats = Array.isArray(m.material) ? m.material : [m.material];
+        mats.forEach((mat) => mat.dispose());
+      }
+    });
+  }
+
+  private updateFrontierChunks(force = false): void {
+    const pcx = Math.round(this.playerX / CHUNK_SIZE);
+    const pcz = Math.round(this.playerZ / CHUNK_SIZE);
+    const key = `${pcx},${pcz}`;
+    if (!force && key === this.lastChunkKey) return;
+    this.lastChunkKey = key;
+
+    const keepRadius = 2; // 5x5 chunk grid = 400m x 400m live procedural world around player
+    for (const [k, chunk] of this.frontierChunks.entries()) {
+      if (Math.abs(chunk.cx - pcx) > keepRadius || Math.abs(chunk.cz - pcz) > keepRadius) {
+        this.scene.remove(chunk.group);
+        this.disposeObjectTree(chunk.group);
+        for (const rid of chunk.resourceIds) {
+          const rm = this.resourceMeshes.get(rid);
+          if (rm) {
+            this.scene.remove(rm);
+            this.disposeObjectTree(rm);
+            this.resourceMeshes.delete(rid);
+          }
+          this.resourceNodes = this.resourceNodes.filter((n) => n.id !== rid);
+          this.pulseHighlights = this.pulseHighlights.filter((h) => h.id !== rid);
+        }
+        for (const bid of chunk.blightIds) {
+          const bn = this.blightNodes.get(bid);
+          if (bn) {
+            this.scene.remove(bn.group);
+            this.disposeObjectTree(bn.group);
+            this.blightNodes.delete(bid);
+            this.pulseHighlights = this.pulseHighlights.filter((h) => h.id !== `blight_${bid}`);
+          }
+        }
+        this.frontierChunks.delete(k);
+      }
+    }
+
+    for (let cx = pcx - keepRadius; cx <= pcx + keepRadius; cx++) {
+      for (let cz = pcz - keepRadius; cz <= pcz + keepRadius; cz++) {
+        // Inner hero [-120..120] covers cx in [-1, 1] && cz in [-1, 1]
+        if (Math.abs(cx) <= 1 && Math.abs(cz) <= 1) continue;
+        const cKey = `${cx}_${cz}`;
+        if (!this.frontierChunks.has(cKey)) {
+          this.buildFrontierChunk(cx, cz, cKey);
+        }
+      }
+    }
+  }
+
+  private buildFrontierChunk(cx: number, cz: number, cKey: string): void {
+    const centerX = cx * CHUNK_SIZE;
+    const centerZ = cz * CHUNK_SIZE;
+    const group = new THREE.Group();
+    const biome = BIOME_PRESETS[this.state.biomePreset];
+
+    // Exact 2.0m grid (80 / 40) matching central terrain edge seamlessly
+    const geo = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, 40, 40);
+    geo.rotateX(-Math.PI / 2);
+    const pos = geo.attributes.position;
+    const colors = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+      const lx = pos.getX(i);
+      const lz = pos.getZ(i);
+      const wx = centerX + lx;
+      const wz = centerZ + lz;
+      const wy = groundHeightAt(wx, wz);
+      pos.setY(i, wy);
+      this.sampleBaseTerrainColor(wx, wz, wy, _colA);
+      colors[i * 3] = _colA.r;
+      colors[i * 3 + 1] = _colA.g;
+      colors[i * 3 + 2] = _colA.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geo.computeVertexNormals();
+
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      map: this.tex.terrainDetail,
+      normalMap: this.tex.terrainNormal,
+      normalScale: new THREE.Vector2(0.85, 0.85),
+      roughness: 0.91,
+      metalness: 0.02,
+    });
+    this.applyPulseShaderToTerrainMat(mat);
+
+    const chunkTerrain = new THREE.Mesh(geo, mat);
+    chunkTerrain.position.set(centerX, 0, centerZ);
+    chunkTerrain.receiveShadow = true;
+    group.add(chunkTerrain);
+
+    const seed = chunkSeedHash(this.state.worldSeed, cx, cz);
+    const rng = createSeededRng(seed);
+    const obstacles: Array<{ x: number; z: number; r: number }> = [];
+    const resourceIds: string[] = [];
+    const blightIds: string[] = [];
+
+    // Trees & Rock Boulders
+    const treeBudget = this.state.biomePreset === 'arid_winds' ? 5 : 10;
+    for (let i = 0; i < treeBudget; i++) {
+      const wx = centerX + (rng() - 0.5) * (CHUNK_SIZE - 8);
+      const wz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 8);
+      const wy = groundHeightAt(wx, wz);
+      if (wy < WATER_LEVEL + 0.5 || terrainSlopeAt(wx, wz) > 0.6) continue;
+      if (Math.abs(wx - riverCenterX(wz)) < riverHalfWidth(wz) + 3) continue;
+      const kind =
+        this.state.biomePreset === 'mystic_night'
+          ? rng() > 0.45
+            ? 'glowwillow'
+            : 'pine'
+          : rng() > 0.5
+            ? 'pine'
+            : 'oak';
+      const scale = 0.85 + rng() * 0.65;
+      const tree = createTreeGroup(kind, this.tex, scale);
+      tree.position.set(wx, wy - 0.1, wz);
+      tree.rotation.y = rng() * TAU;
+      group.add(tree);
+      obstacles.push({ x: wx, z: wz, r: 0.9 * scale });
+    }
+
+    for (let i = 0; i < 4; i++) {
+      const wx = centerX + (rng() - 0.5) * (CHUNK_SIZE - 10);
+      const wz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 10);
+      const wy = groundHeightAt(wx, wz);
+      if (wy < WATER_LEVEL + 0.35) continue;
+      const boulder = createBoulderClusterGroup(this.tex, biome.rockHex);
+      boulder.position.set(wx, wy - 0.15, wz);
+      boulder.rotation.y = rng() * TAU;
+      boulder.scale.setScalar(0.85 + rng() * 0.75);
+      group.add(boulder);
+      obstacles.push({ x: wx, z: wz, r: 1.6 });
+    }
+
+    // Occasional Ancient Frontier Monolith
+    if (rng() < 0.38) {
+      const mx = centerX + (rng() - 0.5) * 32;
+      const mz = centerZ + (rng() - 0.5) * 32;
+      const my = groundHeightAt(mx, mz);
+      if (my > WATER_LEVEL + 0.45 && terrainSlopeAt(mx, mz) < 0.55) {
+        const mono = createMonolithGroup(this.tex, biome.id === 'mystic_night' ? 0xc9a6ff : 0x7ef2c9);
+        mono.position.set(mx, my, mz);
+        mono.rotation.y = rng() * TAU;
+        group.add(mono);
+        obstacles.push({ x: mx, z: mz, r: 1.5 });
+      }
+    }
+
+    // Seeded Frontier Resource Nodes
+    const resTypes: ResourceType[] = ['wood', 'glow', 'water', 'rune', 'seed'];
+    const resCount = 2 + Math.floor(rng() * 2);
+    for (let i = 0; i < resCount; i++) {
+      const rx = centerX + (rng() - 0.5) * (CHUNK_SIZE - 14);
+      const rz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 14);
+      const ry = groundHeightAt(rx, rz);
+      if (ry < WATER_LEVEL + 0.35 || terrainSlopeAt(rx, rz) > 0.7) continue;
+      const rType = resTypes[Math.floor(rng() * resTypes.length)];
+      const rid = `fres_${cKey}_${i}`;
+      const node: WorldResourceNode = {
+        id: rid,
+        type: rType,
+        x: rx,
+        z: rz,
+        active: true,
+        respawnAt: 0,
+        chunkKey: cKey,
+      };
+      this.resourceNodes.push(node);
+      resourceIds.push(rid);
+      const mesh = createResourceNodeMesh(rType);
+      mesh.position.set(rx, ry, rz);
+      this.resourceMeshes.set(rid, mesh);
+      this.scene.add(mesh);
+      this.registerPulseHighlight(
+        rid,
+        'resource',
+        mesh,
+        0x7ef2c9,
+        0.95,
+        2.6,
+        () => ({ x: rx, z: rz }),
+        () => node.active,
+      );
+    }
+
+    // Procedural Frontier Blight Nest in wild chunks (~48% chance)
+    if (rng() < 0.48) {
+      const bx = centerX + (rng() - 0.5) * 40;
+      const bz = centerZ + (rng() - 0.5) * 40;
+      const by = groundHeightAt(bx, bz);
+      if (by > WATER_LEVEL + 0.45 && terrainSlopeAt(bx, bz) < 0.65) {
+        const bid = `fblight_${cKey}`;
+        this.spawnBlightNode(bid, bx, bz, 3, 7.8, cKey);
+        blightIds.push(bid);
+      }
+    }
+
+    this.scene.add(group);
+    this.frontierChunks.set(cKey, {
+      cx,
+      cz,
+      group,
+      terrainMesh: chunkTerrain,
+      obstacles,
+      resourceIds,
+      blightIds,
+    });
+  }
+
+  private createHighlightShell(colorHex: number, radius: number, height: number): {
+    group: THREE.Group;
+    mat: THREE.ShaderMaterial;
+  } {
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uTime: { value: 0 },
+        uIntensity: { value: 0 },
+        uColor: { value: new THREE.Color(colorHex) },
+      },
+      vertexShader: `
+        varying vec3 vNormal;
+        varying vec3 vViewDir;
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+          vNormal = normalize(normalMatrix * normal);
+          vViewDir = normalize(-mvPos.xyz);
+          gl_Position = projectionMatrix * mvPos;
+        }
+      `,
+      fragmentShader: `
+        uniform float uTime;
+        uniform float uIntensity;
+        uniform vec3 uColor;
+        varying vec3 vNormal;
+        varying vec3 vViewDir;
+        varying vec2 vUv;
+        void main() {
+          float fresnel = pow(1.0 - abs(dot(normalize(vNormal), normalize(vViewDir))), 1.7);
+          float scan = 0.55 + 0.45 * sin(vUv.y * 22.0 - uTime * 7.5);
+          float vFade = smoothstep(0.0, 0.16, vUv.y) * (1.0 - smoothstep(0.65, 1.0, vUv.y));
+          float pulse = 0.78 + 0.22 * sin(uTime * 5.0);
+          float alpha = (0.35 + fresnel * 0.85) * scan * vFade * pulse * uIntensity;
+          gl_FragColor = vec4(uColor * 1.25, alpha);
+        }
+      `,
+    });
+
+    const group = new THREE.Group();
+    const shell = new THREE.Mesh(
+      new THREE.CylinderGeometry(radius * 0.78, radius * 1.15, height, 20, 1, true),
+      mat,
+    );
+    shell.position.y = height * 0.5;
+    const baseRing = new THREE.Mesh(new THREE.RingGeometry(radius * 0.85, radius * 1.25, 24), mat);
+    baseRing.rotation.x = -Math.PI / 2;
+    baseRing.position.y = 0.16;
+    group.add(shell, baseRing);
+    group.visible = false;
+    return { group, mat };
+  }
+
+  private registerPulseHighlight(
+    id: string,
+    kind: 'resource' | 'secret' | 'pillar' | 'npc' | 'project' | 'blight',
+    parent: THREE.Group,
+    colorHex: number,
+    radius: number,
+    height: number,
+    getPos: () => { x: number; z: number },
+    isEligible: () => boolean,
+  ): void {
+    const { group, mat } = this.createHighlightShell(colorHex, radius, height);
+    parent.add(group);
+    this.pulseHighlights.push({
+      id,
+      kind,
+      group,
+      mat,
+      getPos,
+      isEligible,
+      startAt: -1,
+      endAt: -1,
+    });
   }
 
   private buildWildlifeAndParticles(): void {
@@ -1131,6 +1903,7 @@ export class WorldEngine {
     for (const l of this.buildingPointLights.values()) this.scene.remove(l);
     this.buildingMeshes.clear();
     this.buildingPointLights.clear();
+    this.buildingHighlights = [];
 
     for (const b of this.state.buildings) {
       const grp = createInventionGroup(b.type, b.tier, this.tex, false);
@@ -1140,6 +1913,18 @@ export class WorldEngine {
       grp.userData.buildingId = b.id;
       this.buildingMeshes.set(b.id, grp);
       this.scene.add(grp);
+
+      const hl = this.createHighlightShell(0x88e9ff, 2.0, 4.4);
+      grp.add(hl.group);
+      this.buildingHighlights.push({
+        id: b.id,
+        group: hl.group,
+        mat: hl.mat,
+        x: b.x,
+        z: b.z,
+        startAt: -1,
+        endAt: -1,
+      });
 
       if (b.type === 'lantern' || b.type === 'bench' || b.type === 'resonance' || (b.type === 'bridge' && b.tier >= 2)) {
         const color =
@@ -1209,6 +1994,17 @@ export class WorldEngine {
 
       this.projectMarkers.set(proj.id, grp);
       this.scene.add(grp);
+      this.pulseHighlights = this.pulseHighlights.filter((h) => h.id !== proj.id);
+      this.registerPulseHighlight(
+        proj.id,
+        'project',
+        grp,
+        0x7ef2c9,
+        2.2,
+        5.5,
+        () => ({ x: proj.x, z: proj.z }),
+        () => (this.state.communityProjects[proj.id] || 0) < proj.maxStages,
+      );
     }
   }
 
@@ -1304,7 +2100,7 @@ export class WorldEngine {
   }
 
   private computeVitality(): number {
-    let score = 8;
+    let score = 12;
     score += this.state.completedQuests.length * 10;
     score += Math.min(20, this.state.buildings.reduce((acc, b) => acc + b.tier * 3, 0));
     score += Math.min(16, this.computeSynergies().length * 5);
@@ -1314,7 +2110,17 @@ export class WorldEngine {
       .filter((b) => b.type === 'irrigator')
       .reduce((acc, b) => acc + b.growth * 10, 0);
     score += Math.min(15, Math.round(bloomSum));
-    return Math.min(100, Math.round(score));
+
+    // Unpurified central blight drains the valley's vitality
+    let activeCentralBlight = 0;
+    for (const spot of VALLEY_BLIGHT_SPOTS) {
+      const bn = this.blightNodes.get(spot.id);
+      if (bn && !bn.purified) activeCentralBlight++;
+    }
+    score -= activeCentralBlight * 6;
+    score += Math.min(12, this.state.blightPurified * 3);
+
+    return Math.max(0, Math.min(100, Math.round(score)));
   }
 
   private computeNpcNeeds(): Record<NpcId, NpcNeedState> {
@@ -1429,6 +2235,8 @@ export class WorldEngine {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    this.composer?.setSize(w, h);
+    this.bloomPass?.setSize(w, h);
   };
 
   private handleBlur = (): void => {
@@ -1436,11 +2244,19 @@ export class WorldEngine {
     this.isDraggingCam = false;
   };
 
+  private unlockAudioFromGesture(): void {
+    if (this.sound.unlockOnGesture()) {
+      this.callbacks.onAudioChange?.(true);
+      this.callbacks.onAudioMixChange?.(this.sound.getMixSettings());
+    }
+  }
+
   private handleKeyDown = (e: KeyboardEvent): void => {
     const t = e.target;
     if (t instanceof HTMLElement && (t.matches('input,textarea,select') || t.isContentEditable)) {
       return;
     }
+    this.unlockAudioFromGesture();
     this.keys[e.code] = true;
     this.keys[e.key.toLowerCase()] = true;
 
@@ -1476,6 +2292,7 @@ export class WorldEngine {
   };
 
   private handlePointerDown = (e: PointerEvent): void => {
+    this.unlockAudioFromGesture();
     this.isDraggingCam = true;
     this.dragMoved = false;
     this.dragStart = { x: e.clientX, y: e.clientY };
@@ -1494,10 +2311,18 @@ export class WorldEngine {
     }
   };
 
+  private getTerrainRaycastTargets(): THREE.Object3D[] {
+    const list: THREE.Object3D[] = [this.terrainMesh];
+    for (const ch of this.frontierChunks.values()) {
+      list.push(ch.terrainMesh);
+    }
+    return list;
+  }
+
   private handlePointerUp = (e: PointerEvent): void => {
     const wasClick = this.isDraggingCam && !this.dragMoved;
     this.isDraggingCam = false;
-    if (!wasClick || this.pausedForDialog) return;
+    if (!wasClick || this.pausedForDialog || this.state.gameOver) return;
 
     this.updatePointerNdc(e);
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
@@ -1523,16 +2348,14 @@ export class WorldEngine {
       }
     }
 
-    // 3. Otherwise raycast terrain to set walk target
-    const terrainHits = this.raycaster.intersectObject(this.terrainMesh, false);
+    // 3. Otherwise raycast hero + frontier terrain to set unbounded walk target
+    const terrainHits = this.raycaster.intersectObjects(this.getTerrainRaycastTargets(), false);
     if (terrainHits.length > 0) {
       const pt = terrainHits[0].point;
-      if (Math.abs(pt.x) < WORLD_HALF - 5 && Math.abs(pt.z) < WORLD_HALF - 5) {
-        this.walkTarget = { x: pt.x, z: pt.z };
-        this.walkWaypointMesh.position.set(pt.x, groundHeightAt(pt.x, pt.z) + 0.12, pt.z);
-        this.walkWaypointMesh.visible = true;
-        this.sound.playSfx('click');
-      }
+      this.walkTarget = { x: pt.x, z: pt.z };
+      this.walkWaypointMesh.position.set(pt.x, groundHeightAt(pt.x, pt.z) + 0.12, pt.z);
+      this.walkWaypointMesh.visible = true;
+      this.sound.playSfx('click');
     }
   };
 
@@ -1565,11 +2388,28 @@ export class WorldEngine {
   }
 
   public toggleAudio(): boolean {
-    return this.sound.toggle();
+    const next = this.sound.toggle();
+    this.callbacks.onAudioChange?.(next);
+    this.callbacks.onAudioMixChange?.(this.sound.getMixSettings());
+    return next;
   }
 
   public isAudioEnabled(): boolean {
     return this.sound.isEnabled();
+  }
+
+  public getAudioMix(): AudioMixSettings {
+    return this.sound.getMixSettings();
+  }
+
+  public setMusicVolume(vol: number): void {
+    const mix = this.sound.setMusicVolume(vol);
+    this.callbacks.onAudioMixChange?.(mix);
+  }
+
+  public setAmbienceVolume(vol: number): void {
+    const mix = this.sound.setAmbienceVolume(vol);
+    this.callbacks.onAudioMixChange?.(mix);
   }
 
   public advanceTimeOfDay(hours = 3): void {
@@ -1660,6 +2500,7 @@ export class WorldEngine {
 
     this.syncBuildingsToScene();
     this.setBuildBlueprint(null);
+    this.evaluateAchievements(true);
     this.persist();
     this.emitHud();
   }
@@ -1715,6 +2556,7 @@ export class WorldEngine {
     this.addJournal(`שדרגת את ${bp.name} לרמה ${nextTier}: ${bp.tiers[nextTier - 1].name}.`, 'build');
     this.toast(`שודרג לרמה ${nextTier}: ${bp.tiers[nextTier - 1].name}!`, 'good');
     this.syncBuildingsToScene();
+    this.evaluateAchievements(true);
     this.persist();
     this.emitHud();
     return true;
@@ -1771,15 +2613,17 @@ export class WorldEngine {
       'good',
     );
     this.syncProjectsToScene();
+    this.evaluateAchievements(true);
     this.persist();
     this.emitHud();
     return true;
   }
 
   public interact(): void {
+    if (this.state.gameOver) return;
     const prompt = this.findNearbyPrompt();
     if (!prompt) {
-      this.toast('אין אינטראקציה ממש לידך. התקרב לדמות, חומר, שריד או מבנה.', 'info');
+      this.toast('אין אינטראקציה ממש לידך. התקרב לדמות, חומר, שריד, נבג קמילה או מבנה.', 'info');
       return;
     }
     if (prompt.kind === 'npc') {
@@ -1787,6 +2631,15 @@ export class WorldEngine {
       this.state.npcMemories[npcId].met = true;
       this.sound.playSfx('talk');
       this.callbacks.onOpenNpc(npcId);
+      this.emitHud();
+    } else if (prompt.kind === 'blight') {
+      const purified = this.damageBlightNode(prompt.id, 1);
+      if (!purified) {
+        const bn = this.blightNodes.get(prompt.id);
+        this.sound.playSfx('pulse');
+        this.toast(`פגעת בנבג הקמילה (${bn?.hp ?? 0}/${bn?.maxHp ?? 0} נותר). לחץ שוב E או שדר Q!`, 'info');
+      }
+      this.persist();
       this.emitHud();
     } else if (prompt.kind === 'resource') {
       this.gatherNearby();
@@ -1852,6 +2705,7 @@ export class WorldEngine {
     if (this.state.ruinPillars.every(Boolean)) {
       this.discoverSecret('secret_ruins_sundial');
     }
+    this.evaluateAchievements(true);
     this.persist();
     this.emitHud();
   }
@@ -1885,41 +2739,200 @@ export class WorldEngine {
     this.sound.playSfx('secret');
     this.addJournal(`סוד נחשף — ${sec.title}: ${sec.lore}`, 'discovery');
     this.toast(`סוד עתיק נחשף: ${sec.title}!`, 'secret');
+    this.evaluateAchievements(true);
     this.persist();
     this.emitHud();
   }
 
+  private damageBlightNode(id: string, dmg: number): boolean {
+    const bn = this.blightNodes.get(id);
+    if (!bn || bn.purified) return false;
+
+    bn.hp = Math.max(0, bn.hp - dmg);
+    const orb = bn.group.userData.orb as THREE.Mesh | undefined;
+    const orbMat = bn.group.userData.orbMat as THREE.MeshStandardMaterial | undefined;
+    const fangMat = bn.group.userData.fangMat as THREE.MeshStandardMaterial | undefined;
+    const auraRing = bn.group.userData.auraRing as THREE.Mesh | undefined;
+
+    if (bn.hp <= 0) {
+      bn.purified = true;
+      if (!this.state.purifiedBlightIds.includes(id)) {
+        this.state.purifiedBlightIds.push(id);
+      }
+      this.state.blightPurified++;
+      this.state.inv.glow = (this.state.inv.glow || 0) + 1;
+      if (id.startsWith('fblight_')) {
+        this.state.inv.seed = (this.state.inv.seed || 0) + 1;
+      } else {
+        this.state.inv.rune = (this.state.inv.rune || 0) + 1;
+      }
+
+      if (orbMat) {
+        orbMat.color.setHex(0x7ef2c9);
+        orbMat.emissive.setHex(0x3ad49f);
+        orbMat.emissiveIntensity = 1.1;
+      }
+      if (fangMat) {
+        fangMat.color.setHex(0x6ba68e);
+        fangMat.emissive.setHex(0x1e5c45);
+        fangMat.emissiveIntensity = 0.3;
+      }
+      if (auraRing) {
+        const rm = auraRing.material as THREE.MeshBasicMaterial;
+        rm.color.setHex(0x7ef2c9);
+        rm.opacity = 0.16;
+      }
+      if (orb) orb.scale.setScalar(0.8);
+
+      // Stun any nearby wisps tied to this node
+      for (const w of this.shadowWisps) {
+        if (w.homeNodeId === id) {
+          w.hp -= 50;
+          w.stunUntil = this.state.simTime + 3;
+        }
+      }
+
+      this.terrainNeedsColorUpdate = true;
+      this.sound.playSfx('purify');
+      this.addJournal(`טיהרת נבג קמילה והחזרת חיים לקרקע.`, 'discovery');
+      this.toast('נבג קמילה טוהר! הקרקע התנקה והרווחת גביש אור-ירח.', 'good');
+      this.evaluateAchievements(true);
+      return true;
+    }
+
+    if (orb) orb.scale.setScalar(1.22);
+    return false;
+  }
+
   public triggerPulse(): void {
+    if (this.pausedForDialog || this.state.gameOver) return;
     if (this.state.simTime < this.pulseCooldownAt) {
       this.toast('גל התהודה עדיין נטען...', 'info');
       return;
     }
-    this.pulseCooldownAt = this.state.simTime + 6;
+    const now = this.state.simTime;
+    this.pulseCooldownAt = now + 5;
+    this.state.pulsesTriggered++;
     this.pulseActive = true;
     this.pulseAge = 0;
     this.pulseOrigin.set(this.playerX, this.playerY + 0.35, this.playerZ);
+    this.pulseUniforms.uOrigin.value.copy(this.pulseOrigin);
+    this.pulseUniforms.uTime.value = 0;
+
     this.pulseRing.position.copy(this.pulseOrigin);
     this.pulseRing.scale.setScalar(1);
     this.pulseRing.visible = true;
+    (this.pulseRing.material as THREE.ShaderMaterial).uniforms.uAge.value = 0;
+
+    this.pulseDome.position.set(this.playerX, this.playerY, this.playerZ);
+    this.pulseDome.scale.setScalar(1);
+    this.pulseDome.visible = true;
+    (this.pulseDome.material as THREE.ShaderMaterial).uniforms.uAge.value = 0;
     this.sound.playSfx('pulse');
 
     let revealed = 0;
     for (const r of this.resourceNodes) {
-      if (r.active && r.hiddenUntilPulse && Math.hypot(r.x - this.playerX, r.z - this.playerZ) < 36) {
-        r.revealedUntil = this.state.simTime + 20;
+      if (r.active && r.hiddenUntilPulse && Math.hypot(r.x - this.playerX, r.z - this.playerZ) < 46) {
+        r.revealedUntil = now + 22;
         const m = this.resourceMeshes.get(r.id);
         if (m) m.visible = true;
         revealed++;
       }
     }
 
-    // If pulsed near cavern entrance, lift mist temporarily or ignite
-    if (!this.state.cavernLit && Math.hypot(this.playerX - 66, this.playerZ + 62) < 20) {
+    // Repel, damage & shatter chasing Shadow Wisps within shockwave radius
+    let shatteredWisps = 0;
+    let damagedWisps = 0;
+    for (let i = this.shadowWisps.length - 1; i >= 0; i--) {
+      const w = this.shadowWisps[i];
+      const dx = w.x - this.playerX;
+      const dz = w.z - this.playerZ;
+      const dist = Math.hypot(dx, dz);
+      if (dist <= 26) {
+        w.hp -= 85;
+        w.stunUntil = now + 3.5;
+        if (dist > 0.2) {
+          const pushX = w.x + (dx / dist) * 6.5;
+          const pushZ = w.z + (dz / dist) * 6.5;
+          if (isWalkableWater(pushX, pushZ, this.state.buildings)) {
+            w.x = pushX;
+            w.z = pushZ;
+          }
+        }
+        if (w.hp <= 0) {
+          this.scene.remove(w.group);
+          this.disposeObjectTree(w.group);
+          this.shadowWisps.splice(i, 1);
+          shatteredWisps++;
+          if (Math.random() < 0.55) {
+            this.state.inv.glow = (this.state.inv.glow || 0) + 1;
+          }
+        } else {
+          damagedWisps++;
+        }
+      }
+    }
+
+    // Purify / weaken Blight Nests within 20m
+    let blightHits = 0;
+    let purifiedNow = 0;
+    for (const bn of this.blightNodes.values()) {
+      if (!bn.purified && Math.hypot(bn.x - this.playerX, bn.z - this.playerZ) <= 20) {
+        blightHits++;
+        if (this.damageBlightNode(bn.id, 1)) {
+          purifiedNow++;
+        }
+      }
+    }
+
+    // Schedule staggered custom-shader highlight overlays as the wavefront reaches each object (max 50m)
+    let highlightedSecrets = 0;
+    let highlightedInteractives = 0;
+    for (const h of this.pulseHighlights) {
+      if (!h.isEligible()) continue;
+      const p = h.getPos();
+      const dist = Math.hypot(p.x - this.playerX, p.z - this.playerZ);
+      if (dist <= 50) {
+        const delay = dist / 24;
+        h.startAt = now + delay;
+        h.endAt = h.startAt + 7.5;
+        if (h.kind === 'secret' || h.kind === 'pillar' || h.kind === 'blight') highlightedSecrets++;
+        else highlightedInteractives++;
+      }
+    }
+    for (const bh of this.buildingHighlights) {
+      const dist = Math.hypot(bh.x - this.playerX, bh.z - this.playerZ);
+      if (dist <= 50) {
+        const delay = dist / 24;
+        bh.startAt = now + delay;
+        bh.endAt = bh.startAt + 6.0;
+        highlightedInteractives++;
+      }
+    }
+
+    // If pulsed near cavern entrance, lift mist and illuminate cavern
+    if (!this.state.cavernLit && Math.hypot(this.playerX - 66, this.playerZ + 62) < 22) {
       this.igniteCavern();
     }
 
-    if (revealed > 0) {
-      this.toast(`תהודה חשפה ${revealed} משאבים חבויים בסביבה!`, 'secret');
+    this.evaluateAchievements(true);
+    this.persist();
+    this.emitHud();
+
+    if (shatteredWisps > 0 || purifiedNow > 0) {
+      this.toast(
+        `הדף תהודה! נופצו ${shatteredWisps} רוחות צל וטוהרו ${purifiedNow} נבגי קמילה!`,
+        'good',
+      );
+    } else if (blightHits > 0 || damagedWisps > 0) {
+      this.toast('גל התהודה החליש והמם איומי קמילה בקרבתך!', 'good');
+    } else if (revealed > 0 || highlightedSecrets > 0) {
+      this.toast(
+        `גל התהודה חשף ${revealed} מרבצים חבויים והאיר ${highlightedSecrets + highlightedInteractives} מוקדים בסביבה!`,
+        'secret',
+      );
+    } else if (highlightedInteractives > 0) {
+      this.toast(`פעימת תהודה האירה ${highlightedInteractives} אובייקטים אינטראקטיביים בטווח.`, 'info');
     } else {
       this.toast('פעימת תהודה נשלחה על פני העמק.', 'info');
     }
@@ -2041,30 +3054,155 @@ export class WorldEngine {
     this.walkWaypointMesh.visible = true;
   }
 
-  public resetWorld(): void {
-    localStorage.removeItem(SAVE_KEY);
-    this.state = createFreshState();
+  public generateNewWorld(config: WorldSeedConfig): void {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+
+    const prevAch = config.keepAchievements ? { ...this.state.unlockedAchievements } : {};
+    setActiveWorldConfig(config.seed, config.biome);
+    this.state = createFreshState(config.seed, config.seedLabel, config.biome);
+    this.state.unlockedAchievements = prevAch;
+
+    // Reset player & camera state
     this.playerX = this.state.playerPos.x;
     this.playerZ = this.state.playerPos.z;
     this.playerY = groundHeightAt(this.playerX, this.playerZ);
+    this.playerVy = 0;
+    this.isGrounded = true;
     this.walkTarget = null;
     this.walkWaypointMesh.visible = false;
-    this.cavernMistMesh.visible = true;
-    this.cavernLight.intensity = 0.4;
-    this.ruinPillarMeshes.forEach((p) => {
-      const ring = p.userData.runeRing as THREE.Mesh;
-      (ring.material as THREE.MeshStandardMaterial).emissive.setHex(0x2d2444);
-    });
-    this.resourceNodes.forEach((r) => {
-      r.active = true;
-      const m = this.resourceMeshes.get(r.id);
-      if (m) m.visible = !r.hiddenUntilPulse;
-    });
+    this.playerHitCooldownAt = 0;
+    this.lastExposureWarnAt = -100;
+    this.setBuildBlueprint(null);
+
+    // Clear Shadow Wisps
+    for (const w of this.shadowWisps) {
+      this.scene.remove(w.group);
+      this.disposeObjectTree(w.group);
+    }
+    this.shadowWisps = [];
+
+    // Clear Blight Nests
+    for (const bn of this.blightNodes.values()) {
+      this.scene.remove(bn.group);
+      this.disposeObjectTree(bn.group);
+    }
+    this.blightNodes.clear();
+
+    // Clear Resources & Secrets
+    for (const rm of this.resourceMeshes.values()) {
+      this.scene.remove(rm);
+      this.disposeObjectTree(rm);
+    }
+    this.resourceMeshes.clear();
+    this.resourceNodes = [];
+    for (const sm of this.secretMeshes.values()) {
+      this.scene.remove(sm);
+      this.disposeObjectTree(sm);
+    }
+    this.secretMeshes.clear();
+
+    // Clear Frontier Chunks
+    for (const chunk of this.frontierChunks.values()) {
+      this.scene.remove(chunk.group);
+      this.disposeObjectTree(chunk.group);
+    }
+    this.frontierChunks.clear();
+    this.lastChunkKey = '';
+
+    // Filter non-NPC highlights cleanly
+    this.pulseHighlights = this.pulseHighlights.filter((h) => h.kind === 'npc');
+
+    // Rebuild Hero Terrain for new seed & biome
+    if (this.terrainMesh) {
+      this.scene.remove(this.terrainMesh);
+      this.terrainMesh.geometry.dispose();
+      (this.terrainMesh.material as THREE.Material).dispose();
+    }
+    this.buildTerrain();
+
+    // Update Water tint
+    const biome = BIOME_PRESETS[config.biome];
+    if (this.waterMesh) {
+      (this.waterMesh.material as THREE.MeshPhysicalMaterial).color.setHex(biome.waterHex);
+    }
+
+    // Rebuild static world props (trees, cottages, ruins, cavern, grass) on new terrain
+    this.disposeObjectTree(this.staticPropsGroup);
+    this.staticPropsGroup.clear();
+    this.buildStaticWorld();
+
+    // Reset NPC positions & Patrol states
+    for (const npc of NPCS_BASE) {
+      const entry = this.npcRigs.get(npc.id);
+      if (entry) {
+        entry.x = npc.homeX;
+        entry.z = npc.homeZ;
+        entry.yaw = 0;
+        entry.rig.group.position.set(npc.homeX, groundHeightAt(npc.homeX, npc.homeZ), npc.homeZ);
+      }
+      this.npcPatrolStates.set(npc.id, {
+        stopIdx: 0,
+        pauseTimer: 2.0,
+        activity: NPC_PATROL_ROUTES[npc.id][0]?.activity || 'מסייר בעמק',
+      });
+    }
+
+    // Repopulate resources, secrets, central blight & outer frontier
+    this.buildResourcesAndSecrets();
     this.syncBuildingsToScene();
     this.syncProjectsToScene();
+    this.updateFrontierChunks(true);
+    this.updateTerrainVitalityColors();
+    this.updateAtmosphereAndDayNight(this.state.simTime);
+    this.evaluateAchievements(false);
     this.persist();
     this.emitHud();
-    this.toast('עולם חדש נזרע. צא לחקור את העמק מחדש!', 'good');
+
+    this.sound.playSfx('secret');
+    this.toast(`עולם חדש נוצר: ${biome.name} (זרע ${config.seedLabel})!`, 'secret');
+  }
+
+  public retryCurrentWorld(): void {
+    this.state.health = 100;
+    this.state.collapseTimer = 0;
+    this.state.gameOver = null;
+    this.playerX = -12;
+    this.playerZ = 2;
+    this.playerY = groundHeightAt(this.playerX, this.playerZ);
+    this.playerVy = 0;
+    this.isGrounded = true;
+    this.walkTarget = null;
+    this.walkWaypointMesh.visible = false;
+    this.playerHitCooldownAt = this.state.simTime + 3;
+
+    // Clear nearby pursuing wisps so player gets a safe breather at the Plaza
+    for (let i = this.shadowWisps.length - 1; i >= 0; i--) {
+      const w = this.shadowWisps[i];
+      if (Math.hypot(w.x - this.playerX, w.z - this.playerZ) < 42) {
+        this.scene.remove(w.group);
+        this.disposeObjectTree(w.group);
+        this.shadowWisps.splice(i, 1);
+      }
+    }
+
+    this.updateFrontierChunks(true);
+    this.persist();
+    this.emitHud();
+    this.toast('התעוררת מחדש בכיכר הלב! טהר את נבגי הקמילה והדף רוחות צל עם Q.', 'good');
+  }
+
+  public resetWorld(): void {
+    const seed = Math.floor(100000 + Math.random() * 899999);
+    this.generateNewWorld({
+      seed,
+      seedLabel: String(seed),
+      biome: this.state.biomePreset,
+      keepAchievements: false,
+    });
   }
 
   private canAfford(cost: Partial<ResourceInventory>): boolean {
@@ -2107,6 +3245,20 @@ export class WorldEngine {
           id: npc.id,
           title: npc.name,
           subtitle: `${npc.title} — לחץ לשיחה מסועפת`,
+          keyHint: 'E',
+        };
+      }
+    }
+
+    // 1.5 Active Blight Nests (E or Q to purify)
+    for (const bn of this.blightNodes.values()) {
+      if (bn.purified) continue;
+      if (Math.hypot(bn.x - this.playerX, bn.z - this.playerZ) < 5.6) {
+        return {
+          kind: 'blight',
+          id: bn.id,
+          title: 'נבג קמילה פעיל',
+          subtitle: `חוזק ${bn.hp}/${bn.maxHp} — לחץ E או שדר Q לטיהור`,
           keyHint: 'E',
         };
       }
@@ -2195,7 +3347,11 @@ export class WorldEngine {
     this.lastTime = now;
 
     this.stepSimulation(dt);
-    this.renderer.render(this.scene, this.camera);
+    if (!this.isSoftwareGl && this.composer) {
+      this.composer.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
 
     if (this.isSoftwareGl) {
       this.afterDraw(this.loop);
@@ -2226,7 +3382,8 @@ export class WorldEngine {
   }
 
   private stepSimulation(dt: number): void {
-    if (!this.pausedForDialog) {
+    const activePlay = !this.pausedForDialog && !this.state.gameOver;
+    if (activePlay) {
       this.state.simTime += dt;
     }
     const t = this.state.simTime;
@@ -2234,21 +3391,49 @@ export class WorldEngine {
     this.grassUniforms.uTime.value = t;
 
     this.updateAtmosphereAndDayNight(t);
-    this.updatePlayerMovement(dt, t);
-    this.updateNpcs(dt, t);
-    this.updateWorldObjects(dt, t);
-    this.updateBuildGhost();
+    if (activePlay) {
+      this.updatePlayerMovement(dt, t);
+      this.updateFrontierChunks(false);
+      this.updateThreatsAndHealth(dt, t);
+    }
+    if (!this.state.gameOver) {
+      this.updateNpcs(dt, t);
+      this.updateWorldObjects(dt, t);
+      this.updateBuildGhost();
+    }
     this.updateCamera(dt);
 
-    // Periodic simulation (ecosystems, resource respawns, weather shifts, promises)
+    // Infinite water grid follows player in 16m quantized increments to avoid UV/wave shimmer
+    if (this.waterMesh) {
+      this.waterMesh.position.set(
+        Math.round(this.playerX / 16) * 16,
+        WATER_LEVEL,
+        Math.round(this.playerZ / 16) * 16,
+      );
+    }
+
+    // Periodic simulation (ecosystems, wisps, resource respawns, weather shifts, promises)
     this.simTickTimer += dt;
-    if (this.simTickTimer >= 1.5 && !this.pausedForDialog) {
+    if (this.simTickTimer >= 1.5 && activePlay) {
       this.stepEcosystemSystems(this.simTickTimer);
       this.simTickTimer = 0;
     }
 
-    // Audio
-    this.sound.update(t, this.state.weather, this.computeVitality());
+    // Zone-adaptive music + 3D spatial nature ambience
+    const activeZone = detectZone(this.playerX, this.playerZ);
+    const { isNight } = this.getClockInfo(t);
+    this.sound.update({
+      simTime: t,
+      weather: this.state.weather,
+      vitality: this.computeVitality(),
+      zone: activeZone,
+      isNight,
+      playerX: this.playerX,
+      playerY: this.playerY,
+      playerZ: this.playerZ,
+      camYaw: this.camYaw,
+      riverX: riverCenterX(this.playerZ),
+    });
 
     // HUD & Auto-Save
     this.hudSyncTimer += dt;
@@ -2257,7 +3442,7 @@ export class WorldEngine {
       this.emitHud();
     }
     this.saveTimer += dt;
-    if (this.saveTimer >= 6) {
+    if (this.saveTimer >= 6 && activePlay) {
       this.saveTimer = 0;
       this.persist();
     }
@@ -2416,10 +3601,21 @@ export class WorldEngine {
       (this.scene.fog as THREE.FogExp2).density = isDayArc ? 0.0058 : 0.0074;
     }
 
+    // Blend subtle biome atmospheric tint for distinct world identity
+    const biomeMeta = BIOME_PRESETS[this.state.biomePreset];
+    if (this.state.biomePreset !== 'verdant') {
+      _colC.setHex(biomeMeta.skyTintHex);
+      _colA.lerp(_colC, this.state.biomePreset === 'mystic_night' ? 0.32 : 0.2);
+    }
+
     this.sunLight.color.copy(_colB);
     (this.scene.background as THREE.Color).copy(_colA);
     (this.scene.fog as THREE.FogExp2).color.copy(_colA);
     (this.skyDome.material as THREE.MeshBasicMaterial).color.copy(_colA);
+
+    // Keep sky dome & starfield centered around player for boundless horizons
+    this.skyDome.position.set(this.playerX, 0, this.playerZ);
+    this.starsPoints.position.set(this.playerX, 0, this.playerZ);
 
     // Reactive night elements: stars, fireflies, cottage windows, placed lantern/hearth lights
     const nightFactor = THREE.MathUtils.clamp((-sunHeight + 0.12) / 0.5, 0, 1);
@@ -2490,13 +3686,21 @@ export class WorldEngine {
     }
 
     if (moving) {
-      const candX = THREE.MathUtils.clamp(this.playerX + moveWorldX * speed * dt, -WORLD_HALF + 8, WORLD_HALF - 8);
-      const candZ = THREE.MathUtils.clamp(this.playerZ + moveWorldZ * speed * dt, -WORLD_HALF + 8, WORLD_HALF - 8);
+      const candX = this.playerX + moveWorldX * speed * dt;
+      const candZ = this.playerZ + moveWorldZ * speed * dt;
 
       const canMoveTo = (x: number, z: number): boolean => {
         if (!isWalkableWater(x, z, this.state.buildings)) return false;
-        if (terrainSlopeAt(x, z) > 1.35) return false;
-        if (this.staticObstacles.some((o) => Math.hypot(x - o.x, z - o.z) < o.r + 0.5)) return false;
+        if (terrainSlopeAt(x, z) > 1.38) return false;
+        if (Math.hypot(x, z) < 128 && this.staticObstacles.some((o) => Math.hypot(x - o.x, z - o.z) < o.r + 0.5)) {
+          return false;
+        }
+        const pcx = Math.round(x / CHUNK_SIZE);
+        const pcz = Math.round(z / CHUNK_SIZE);
+        const ch = this.frontierChunks.get(`${pcx}_${pcz}`);
+        if (ch && ch.obstacles.some((o) => Math.hypot(x - o.x, z - o.z) < o.r + 0.5)) {
+          return false;
+        }
         return true;
       };
 
@@ -2541,45 +3745,249 @@ export class WorldEngine {
     this.playerRig.bodyGroup.position.y = moving ? Math.abs(Math.sin(this.playerWalkPhase)) * 0.08 : Math.sin(t * 2.2) * 0.025;
     this.playerRig.scarf.rotation.x = 0.25 + (moving ? (sprinting ? 0.65 : 0.4) : Math.sin(t * 2) * 0.08);
 
-    // Zone arrival detection
+    // Zone arrival detection & achievement tracking
     const zId = detectZone(this.playerX, this.playerZ);
+    if (!this.state.visitedZones.includes(zId)) {
+      this.state.visitedZones.push(zId);
+      this.evaluateAchievements(true);
+    }
     if (zId !== this.lastZoneId) {
       this.lastZoneId = zId;
       if (zId === 'cavern' && !this.state.cavernLit) {
         this.toast('הגעת לפתח מערת הגבישים. שדר פעימת תהודה (Q) או הצב פנס כדי להאיר בפנים.', 'info');
       } else if (zId === 'island') {
         this.toast('הגעת אל אי המפל החבוי!', 'secret');
+      } else if (zId === 'ruins') {
+        this.toast('נכנסת לשרידים השקועים — אווירה מסתורית ועמודי רונה עתיקים סביבך.', 'info');
+      } else if (zId === 'forest') {
+        this.toast('נכנסת ליער הערפל והנבגים — לחץ Q כדי לחשוף נבגים חבויים.', 'info');
+      } else if (zId === 'frontier') {
+        this.toast('חצית אל מרחבי הספר האינסופיים! היזהר מנבגי קמילה ואסוף משאבים נדירים.', 'secret');
       }
     }
   }
 
+  private triggerGameOver(reason: 'health' | 'collapse'): void {
+    if (this.state.gameOver) return;
+    const biomeName = BIOME_PRESETS[this.state.biomePreset].name;
+    this.state.gameOver = {
+      reason,
+      title: reason === 'health' ? 'הרוח בעמק כבתה' : 'העמק שקע בקמילה',
+      message:
+        reason === 'health'
+          ? 'רוחות הצל והקור הכריעו אותך, אך זיכרון העמק עוד מהדהד וממתין לסיבוב נוסף.'
+          : 'נבגי הקמילה רוקנו את חיוניות העמק לחלוטין. עליך לפזר אותם בעזרת תהודה (Q) ובנייה מתואמת.',
+      daysSurvived: this.state.day,
+      blightPurified: this.state.blightPurified,
+      vitality: this.computeVitality(),
+      seedLabel: this.state.seedLabel,
+      biomeLabel: biomeName,
+    };
+    this.walkTarget = null;
+    this.walkWaypointMesh.visible = false;
+    this.setBuildBlueprint(null);
+    this.sound.playSfx('damage');
+    this.persist();
+    this.emitHud();
+  }
+
+  private updateThreatsAndHealth(dt: number, t: number): void {
+    const { isNight } = this.getClockInfo(t);
+    const sanctuaries = this.state.buildings.filter(
+      (b) => b.type === 'lantern' || b.type === 'resonance' || b.type === 'bench',
+    );
+    const inPlazaHearth = Math.hypot(this.playerX + 15, this.playerZ) < 15;
+    const nearBench = sanctuaries.some(
+      (b) => b.type === 'bench' && Math.hypot(this.playerX - b.x, this.playerZ - b.z) < 11,
+    );
+    const nearAnyLight =
+      inPlazaHearth ||
+      sanctuaries.some(
+        (b) => Math.hypot(this.playerX - b.x, this.playerZ - b.z) < (b.type === 'resonance' ? 20 : 14),
+      );
+
+    // Health regeneration in safe sanctuaries & Benches
+    if (nearBench) {
+      this.state.health = Math.min(100, this.state.health + 4.8 * dt);
+    } else if (inPlazaHearth) {
+      this.state.health = Math.min(100, this.state.health + 2.4 * dt);
+    }
+
+    // Night freezing rain exposure outside lit shelter
+    if (isNight && this.state.weather === 'rain' && !nearAnyLight) {
+      this.state.health = Math.max(0, this.state.health - 1.7 * dt);
+      if (t - this.lastExposureWarnAt > 26) {
+        this.lastExposureWarnAt = t;
+        this.toast('גשם לילי מקפיא! התקרב לפנס, ספסל או לכיכר הלב.', 'warn');
+      }
+    }
+
+    // Blight Spore Aura DoT
+    const shieldedByResonance = sanctuaries.some(
+      (b) => b.type === 'resonance' && Math.hypot(this.playerX - b.x, this.playerZ - b.z) < 14,
+    );
+    for (const bn of this.blightNodes.values()) {
+      if (bn.purified) continue;
+      if (Math.hypot(this.playerX - bn.x, this.playerZ - bn.z) < bn.radius && !shieldedByResonance) {
+        this.state.health = Math.max(0, this.state.health - 6.8 * dt);
+      }
+    }
+
+    // Update patrolling & chasing Shadow Wisps
+    for (let i = this.shadowWisps.length - 1; i >= 0; i--) {
+      const w = this.shadowWisps[i];
+      if (w.hp <= 0) {
+        this.scene.remove(w.group);
+        this.disposeObjectTree(w.group);
+        this.shadowWisps.splice(i, 1);
+        continue;
+      }
+
+      if (t < w.stunUntil) continue;
+
+      // Placed Lanterns & Resonance Towers burn and repel nearby Shadow Wisps
+      let burned = false;
+      for (const s of sanctuaries) {
+        if (s.type !== 'lantern' && s.type !== 'resonance') continue;
+        const rLight = s.type === 'resonance' ? 18 : 13;
+        const dLight = Math.hypot(w.x - s.x, w.z - s.z);
+        if (dLight < rLight && dLight > 0.2) {
+          w.hp -= 28 * dt;
+          w.x += ((w.x - s.x) / dLight) * 6.0 * dt;
+          w.z += ((w.z - s.z) / dLight) * 6.0 * dt;
+          burned = true;
+        }
+      }
+      if (burned && w.hp <= 0) {
+        this.scene.remove(w.group);
+        this.disposeObjectTree(w.group);
+        this.shadowWisps.splice(i, 1);
+        continue;
+      }
+
+      const dx = this.playerX - w.x;
+      const dz = this.playerZ - w.z;
+      const dPlayer = Math.hypot(dx, dz);
+
+      // Chase if within detection range (player is safe in inner Plaza hearth during day)
+      const aggroRange = isNight ? 46 : 30;
+      if (dPlayer < aggroRange && !inPlazaHearth) {
+        const wSpeed = isNight ? 6.1 : 4.4;
+        const nx = w.x + (dx / Math.max(0.01, dPlayer)) * wSpeed * dt;
+        const nz = w.z + (dz / Math.max(0.01, dPlayer)) * wSpeed * dt;
+        w.x = nx;
+        w.z = nz;
+        w.yaw = Math.atan2(dx, dz);
+      } else {
+        // Gentle prowl orbit around spawn origin
+        w.phase += dt * 0.9;
+        w.x += Math.cos(w.phase) * 1.4 * dt;
+        w.z += Math.sin(w.phase * 0.8) * 1.4 * dt;
+        w.yaw = Math.atan2(Math.cos(w.phase), Math.sin(w.phase * 0.8));
+      }
+
+      // Melee strike on player
+      if (dPlayer < 1.85 && t >= this.playerHitCooldownAt) {
+        this.playerHitCooldownAt = t + 1.5;
+        this.state.health = Math.max(0, this.state.health - 18);
+        this.sound.playSfx('damage');
+        this.toast('רוח צל פגעה בך! הפעל תהודה (Q) כדי להדוף ולנפץ אותה!', 'warn');
+        if (dPlayer > 0.1) {
+          const kx = this.playerX + (dx / dPlayer) * 2.2;
+          const kz = this.playerZ + (dz / dPlayer) * 2.2;
+          if (isWalkableWater(kx, kz, this.state.buildings)) {
+            this.playerX = kx;
+            this.playerZ = kz;
+          }
+        }
+      }
+    }
+
+    if (this.state.health <= 0) {
+      this.triggerGameOver('health');
+    }
+  }
+
   private updateNpcs(dt: number, t: number): void {
-    const needs = this.computeNpcNeeds();
     const benches = this.state.buildings.filter((b) => b.type === 'bench');
-    const isEvening = Math.sin((t % 300) / 300 * TAU) < 0.15;
+    const cycleSin = Math.sin(((t % 300) / 300) * TAU);
+    const isDayPatrol = cycleSin >= 0.08;
+    const isEveningGather = cycleSin < 0.08 && cycleSin >= -0.25 && benches.length > 0;
+    const hasMainBridge = this.state.buildings.some(
+      (b) => b.type === 'bridge' && Math.hypot(b.x - MAIN_BRIDGE_POS.x, b.z - MAIN_BRIDGE_POS.z) < 14,
+    );
 
     for (const npc of NPCS_BASE) {
       const entry = this.npcRigs.get(npc.id);
-      if (!entry) continue;
+      const pState = this.npcPatrolStates.get(npc.id);
+      if (!entry || !pState) continue;
 
-      let goalX = needs[npc.id].focusX;
-      let goalZ = needs[npc.id].focusZ;
+      const route = NPC_PATROL_ROUTES[npc.id];
+      let goalX = npc.homeX;
+      let goalZ = npc.homeZ;
+      let desiredActivity = pState.activity;
 
-      // If benches exist in the evening, NPCs actually walk to gather near them!
-      if (isEvening && benches.length > 0 && Math.sin(t * 0.08 + entry.phase) > -0.2) {
+      const nearPlayer = Math.hypot(this.playerX - entry.x, this.playerZ - entry.z) < 3.6;
+
+      if (this.focusNpcId === npc.id || (nearPlayer && !this.pausedForDialog)) {
+        goalX = entry.x;
+        goalZ = entry.z;
+        desiredActivity = 'משוחח איתך';
+        entry.yaw = Math.atan2(this.playerX - entry.x, this.playerZ - entry.z);
+      } else if (isDayPatrol && route && route.length > 0) {
+        const stop = route[pState.stopIdx % route.length];
+        goalX = stop.x;
+        goalZ = stop.z;
+        const dStop = Math.hypot(goalX - entry.x, goalZ - entry.z);
+        if (dStop <= 1.35) {
+          pState.pauseTimer -= dt;
+          desiredActivity = stop.activity;
+          if (pState.pauseTimer <= 0) {
+            pState.stopIdx = (pState.stopIdx + 1) % route.length;
+            pState.pauseTimer = route[pState.stopIdx].pause;
+            desiredActivity = 'בדרכו לתחנה הבאה';
+          }
+        } else {
+          desiredActivity = stop.activity;
+        }
+      } else if (isEveningGather && benches.length > 0) {
         const b = benches[0];
-        const angle = entry.phase;
-        goalX = b.x + Math.cos(angle) * 2.8;
-        goalZ = b.z + Math.sin(angle) * 2.8;
+        goalX = b.x + Math.cos(entry.phase) * 2.8;
+        goalZ = b.z + Math.sin(entry.phase) * 2.8;
+        desiredActivity = 'נח ליד מדורת המפגש';
+      } else {
+        goalX = npc.homeX;
+        goalZ = npc.homeZ;
+        desiredActivity = cycleSin < -0.25 ? 'שוהה בנקודה מוארת בלילה' : 'שב לכיכר';
       }
 
-      const dx = goalX - entry.x;
-      const dz = goalZ - entry.z;
+      pState.activity = desiredActivity;
+
+      // Smart river crossing routing if waypoint lies across the river
+      const myRiverX = riverCenterX(entry.z);
+      const goalRiverX = riverCenterX(goalZ);
+      const crossesRiver =
+        (entry.x < myRiverX - 5 && goalX > goalRiverX + 5) ||
+        (entry.x > myRiverX + 5 && goalX < goalRiverX - 5);
+      let moveTargetX = goalX;
+      let moveTargetZ = goalZ;
+      if (crossesRiver && Math.hypot(goalX - entry.x, goalZ - entry.z) > 10) {
+        if (hasMainBridge) {
+          moveTargetX = MAIN_BRIDGE_POS.x;
+          moveTargetZ = MAIN_BRIDGE_POS.z;
+        } else {
+          moveTargetX = riverCenterX(FORD_Z);
+          moveTargetZ = FORD_Z;
+        }
+      }
+
+      const dx = moveTargetX - entry.x;
+      const dz = moveTargetZ - entry.z;
       const dist = Math.hypot(dx, dz);
       let walking = false;
 
-      if (dist > 1.2) {
-        const step = Math.min(dist, 3.2 * dt);
+      if (dist > 1.25 && desiredActivity !== 'משוחח איתך') {
+        const step = Math.min(dist, 3.4 * dt);
         const nx = entry.x + (dx / dist) * step;
         const nz = entry.z + (dz / dist) * step;
         if (isWalkableWater(nx, nz, this.state.buildings)) {
@@ -2587,9 +3995,11 @@ export class WorldEngine {
           entry.z = nz;
           entry.yaw = Math.atan2(dx, dz);
           walking = true;
+        } else if (isWalkableWater(entry.x, nz, this.state.buildings)) {
+          entry.z = nz;
+          entry.yaw = Math.atan2(0, dz);
+          walking = true;
         }
-      } else if (this.focusNpcId === npc.id) {
-        entry.yaw = Math.atan2(this.playerX - entry.x, this.playerZ - entry.z);
       }
 
       const ny = bridgeDeckHeightAt(entry.x, entry.z, this.state.buildings) ?? groundHeightAt(entry.x, entry.z);
@@ -2601,7 +4011,9 @@ export class WorldEngine {
       entry.rig.rightLeg.rotation.x = -s;
       entry.rig.leftArm.rotation.x = -s * 0.6;
       entry.rig.rightArm.rotation.x = s * 0.6;
-      entry.rig.bodyGroup.position.y = walking ? Math.abs(Math.sin(t * 7 + entry.phase)) * 0.06 : Math.sin(t * 1.8 + entry.phase) * 0.025;
+      entry.rig.bodyGroup.position.y = walking
+        ? Math.abs(Math.sin(t * 7 + entry.phase)) * 0.06
+        : Math.sin(t * 1.8 + entry.phase) * 0.025;
     }
   }
 
@@ -2633,17 +4045,46 @@ export class WorldEngine {
       }
     }
 
-    // Pulse wave expansion
+    // Pulse wave expansion & custom shader overlay updates
     if (this.pulseActive) {
       this.pulseAge += dt;
-      const dur = 1.65;
+      this.pulseUniforms.uTime.value = this.pulseAge;
+      const dur = 2.4;
       if (this.pulseAge >= dur) {
         this.pulseActive = false;
+        this.pulseUniforms.uTime.value = -1;
         this.pulseRing.visible = false;
+        this.pulseDome.visible = false;
       } else {
-        const k = this.pulseAge / dur;
-        this.pulseRing.scale.setScalar(1 + k * 42);
-        (this.pulseRing.material as THREE.MeshBasicMaterial).opacity = (1 - k) * 0.78;
+        const radius = 1 + this.pulseAge * 24;
+        this.pulseRing.scale.setScalar(radius);
+        (this.pulseRing.material as THREE.ShaderMaterial).uniforms.uAge.value = this.pulseAge;
+        this.pulseDome.scale.setScalar(radius);
+        (this.pulseDome.material as THREE.ShaderMaterial).uniforms.uAge.value = this.pulseAge;
+      }
+    }
+
+    // Update custom Fresnel/scanline highlight overlays on interactives & secrets
+    for (const h of this.pulseHighlights) {
+      if (h.endAt > t && t >= h.startAt && h.isEligible()) {
+        const fadeIn = Math.min(1, (t - h.startAt) / 0.35);
+        const fadeOut = Math.min(1, (h.endAt - t) / 1.4);
+        h.group.visible = true;
+        h.mat.uniforms.uTime.value = t;
+        h.mat.uniforms.uIntensity.value = fadeIn * fadeOut;
+      } else if (h.group.visible) {
+        h.group.visible = false;
+      }
+    }
+    for (const bh of this.buildingHighlights) {
+      if (bh.endAt > t && t >= bh.startAt) {
+        const fadeIn = Math.min(1, (t - bh.startAt) / 0.35);
+        const fadeOut = Math.min(1, (bh.endAt - t) / 1.4);
+        bh.group.visible = true;
+        bh.mat.uniforms.uTime.value = t;
+        bh.mat.uniforms.uIntensity.value = fadeIn * fadeOut * 0.85;
+      } else if (bh.group.visible) {
+        bh.group.visible = false;
       }
     }
 
@@ -2689,7 +4130,68 @@ export class WorldEngine {
       this.walkWaypointMesh.scale.setScalar(1 + Math.sin(t * 6) * 0.14);
     }
 
-    // Update terrain vertex hydration if needed
+    // Animate active Shadow Wisps & Blight orbs
+    for (const w of this.shadowWisps) {
+      const groundY = groundHeightAt(w.x, w.z);
+      const bob = Math.sin(t * 3.4 + w.phase) * 0.25;
+      w.group.position.set(w.x, groundY + bob, w.z);
+      w.group.rotation.y = w.yaw;
+      const orbit = w.group.userData.orbit as THREE.Group | undefined;
+      if (orbit) orbit.rotation.y += dt * (t < w.stunUntil ? 0.6 : 3.2);
+    }
+
+    for (const bn of this.blightNodes.values()) {
+      const orb = bn.group.userData.orb as THREE.Mesh | undefined;
+      if (orb) {
+        orb.rotation.y = t * (bn.purified ? 0.6 : 1.8);
+        orb.position.y = 2.0 + Math.sin(t * 2.5 + bn.x) * 0.16;
+      }
+    }
+
+    // Drift 3D clouds smoothly overhead relative to player
+    for (const ch of this.cloudGroup.children) {
+      const base = ch.userData.baseOffset as THREE.Vector3 | undefined;
+      const spd = (ch.userData.speed as number) || 1.5;
+      if (base) {
+        const wx = ((base.x + t * spd + 200) % 400) - 200 + this.playerX;
+        const wz = ((base.z + t * spd * 0.25 + 200) % 400) - 200 + this.playerZ;
+        ch.position.set(wx, base.y, wz);
+      }
+    }
+
+    // Swirl waterfall splash mist plume
+    if (this.waterfallMistPoints) {
+      const mPos = this.waterfallMistPoints.geometry.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < mPos.count; i++) {
+        let my = mPos.getY(i) + 1.45 * dt;
+        if (my > WATER_LEVEL + 3.2) {
+          my = WATER_LEVEL + 0.1;
+          mPos.setX(i, 71.5 + (Math.random() - 0.5) * 4.5);
+          mPos.setZ(i, 45.2 + (Math.random() - 0.5) * 4.5);
+        }
+        mPos.setY(i, my);
+      }
+      mPos.needsUpdate = true;
+    }
+
+    // Wrap fireflies subtly around player for endless world ambience
+    if (this.firefliesPoints) {
+      const fPos = this.firefliesPoints.geometry.attributes.position as THREE.BufferAttribute;
+      let fDirty = false;
+      for (let i = 0; i < fPos.count; i++) {
+        const fx = fPos.getX(i);
+        const fz = fPos.getZ(i);
+        if (Math.abs(fx - this.playerX) > 95 || Math.abs(fz - this.playerZ) > 95) {
+          const nx = this.playerX + (Math.random() - 0.5) * 140;
+          const nz = this.playerZ + (Math.random() - 0.5) * 140;
+          fPos.setXYZ(i, nx, groundHeightAt(nx, nz) + 1.1 + Math.random() * 2.5, nz);
+          fDirty = true;
+        }
+      }
+      if (fDirty) fPos.needsUpdate = true;
+    }
+
+    // Update terrain vertex hydration / blight coloration if needed
     if (this.terrainNeedsColorUpdate) {
       this.updateTerrainVitalityColors();
     }
@@ -2699,7 +4201,7 @@ export class WorldEngine {
     if (!this.activeBlueprint || !this.ghostGroup) return;
 
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
-    const hits = this.raycaster.intersectObject(this.terrainMesh, false);
+    const hits = this.raycaster.intersectObjects(this.getTerrainRaycastTargets(), false);
     if (hits.length === 0) {
       this.ghostGroup.visible = false;
       this.ghostRing.visible = false;
@@ -2820,14 +4322,137 @@ export class WorldEngine {
       }
     }
 
+    // Spawn Shadow Wisps from nearby unpurified Blight Nests
+    const { isNight } = this.getClockInfo(this.state.simTime);
+    const biomeRate = BIOME_PRESETS[this.state.biomePreset].blightRate;
+    const maxWisps = isNight ? 6 : 3;
+    this.wispSpawnTimer += dt * (isNight ? 1.5 : 0.7) * biomeRate;
+    if (this.wispSpawnTimer >= 9.5 && this.shadowWisps.length < maxWisps) {
+      this.wispSpawnTimer = 0;
+      const nearbyBlights = Array.from(this.blightNodes.values()).filter(
+        (bn) => !bn.purified && Math.hypot(bn.x - this.playerX, bn.z - this.playerZ) < 95,
+      );
+      if (nearbyBlights.length > 0) {
+        const src = nearbyBlights[Math.floor(Math.random() * nearbyBlights.length)];
+        const angle = Math.random() * TAU;
+        const wx = src.x + Math.cos(angle) * 4.5;
+        const wz = src.z + Math.sin(angle) * 4.5;
+        const grp = createShadowWispGroup();
+        grp.position.set(wx, groundHeightAt(wx, wz), wz);
+        this.scene.add(grp);
+        this.shadowWisps.push({
+          id: `wisp_${Date.now()}_${Math.random().toString(16).slice(2, 5)}`,
+          x: wx,
+          z: wz,
+          yaw: Math.random() * TAU,
+          hp: 100,
+          maxHp: 100,
+          stunUntil: 0,
+          homeNodeId: src.id,
+          phase: Math.random() * TAU,
+          group: grp,
+        });
+        changed = true;
+      }
+    }
+
+    // Valley Ecosystem Collapse Countdown when vitality hits 0% under active blight
+    const activeBlightCount = Array.from(this.blightNodes.values()).filter((bn) => !bn.purified).length;
+    const vitality = this.computeVitality();
+    if (vitality <= 0 && activeBlightCount > 0) {
+      this.state.collapseTimer += dt;
+      if (this.state.collapseTimer >= 30) {
+        this.triggerGameOver('collapse');
+      }
+      changed = true;
+    } else if (this.state.collapseTimer > 0) {
+      this.state.collapseTimer = Math.max(0, this.state.collapseTimer - dt * 1.5);
+      changed = true;
+    }
+
     if (changed) {
+      this.evaluateAchievements(true);
       this.emitHud();
+    }
+  }
+
+  private getAchievementMetric(id: string): number {
+    switch (id) {
+      case 'ach_first_spark':
+      case 'ach_build_streak':
+        return this.state.buildings.length;
+      case 'ach_synergy_weaver':
+        return this.computeSynergies().length;
+      case 'ach_master_architect':
+        return this.state.buildings.filter((b) => b.tier >= 3).length;
+      case 'ach_pulse_seeker':
+        return this.state.pulsesTriggered;
+      case 'ach_cavern_light':
+        return this.state.cavernLit ? 1 : 0;
+      case 'ach_ruins_awakener':
+        return this.state.ruinPillars.filter(Boolean).length;
+      case 'ach_all_secrets':
+        return this.state.discoveredSecrets.length;
+      case 'ach_world_wanderer':
+        return this.state.visitedZones.length;
+      case 'ach_kindred_spirits':
+        return this.state.completedQuests.length;
+      case 'ach_community_builder':
+        return COMMUNITY_PROJECTS_DATA.filter(
+          (p) => (this.state.communityProjects[p.id] || 0) >= p.maxStages,
+        ).length;
+      case 'ach_valley_bloom':
+        return this.computeVitality();
+      default:
+        return 0;
+    }
+  }
+
+  private getAchievementStates(): AchievementState[] {
+    return ACHIEVEMENTS.map((def) => {
+      const unlockedDay = this.state.unlockedAchievements[def.id];
+      const metric = this.getAchievementMetric(def.id);
+      const unlocked = unlockedDay !== undefined || metric >= def.target;
+      return {
+        id: def.id,
+        unlocked,
+        unlockedDay,
+        current: Math.min(def.target, metric),
+        target: def.target,
+      };
+    });
+  }
+
+  private evaluateAchievements(notify = true): void {
+    let anyNew = false;
+    for (const def of ACHIEVEMENTS) {
+      if (this.state.unlockedAchievements[def.id] !== undefined) continue;
+      const metric = this.getAchievementMetric(def.id);
+      if (metric >= def.target) {
+        this.state.unlockedAchievements[def.id] = this.state.day;
+        anyNew = true;
+        if (def.reward) {
+          for (const [k, v] of Object.entries(def.reward)) {
+            const rk = k as ResourceType;
+            this.state.inv[rk] = (this.state.inv[rk] || 0) + (v || 0);
+          }
+        }
+        if (notify) {
+          this.sound.playSfx('complete');
+          this.addJournal(`הישג נפתח: ${def.title} — ${def.desc}`, 'discovery');
+          this.toast(`הישג חדש נפתח: ${def.title}!`, 'secret');
+        }
+      }
+    }
+    if (anyNew) {
+      this.persist();
     }
   }
 
   private emitHud(): void {
     const zId = detectZone(this.playerX, this.playerZ);
     const zMeta = ZONES[zId];
+    const biomeMeta = BIOME_PRESETS[this.state.biomePreset];
     const { cycle, clockLabel, timeOfDayLabel, isNight } = this.getClockInfo(this.state.simTime);
     const weatherLabels: Record<WeatherType, string> = {
       clear: 'שמיים צלולים',
@@ -2835,6 +4460,29 @@ export class WorldEngine {
       mist: 'ערפל עדין',
       rain: 'גשם מרווה',
     };
+
+    const vitality = this.computeVitality();
+    const activeBlightCount = Array.from(this.blightNodes.values()).filter((bn) => !bn.purified).length;
+    const activeWispsCount = this.shadowWisps.length;
+    const threatLevel = Math.min(
+      100,
+      Math.round(activeBlightCount * 14 + activeWispsCount * 15 + (isNight ? 18 : 0)),
+    );
+    const collapseCountdown =
+      vitality <= 0 && activeBlightCount > 0 && this.state.collapseTimer > 0
+        ? Math.max(0, Math.ceil(30 - this.state.collapseTimer))
+        : null;
+
+    const npcPositions = {} as Record<NpcId, { x: number; z: number; activity: string }>;
+    for (const npc of NPCS_BASE) {
+      const rig = this.npcRigs.get(npc.id);
+      const pSt = this.npcPatrolStates.get(npc.id);
+      npcPositions[npc.id] = {
+        x: rig?.x ?? npc.homeX,
+        z: rig?.z ?? npc.homeZ,
+        activity: pSt?.activity || 'מסייר בעמק',
+      };
+    }
 
     this.callbacks.onHudUpdate({
       inv: { ...this.state.inv },
@@ -2848,11 +4496,25 @@ export class WorldEngine {
       isNight,
       weather: this.state.weather,
       weatherLabel: weatherLabels[this.state.weather],
-      vitality: this.computeVitality(),
+      vitality,
+      health: Math.round(this.state.health),
       stamina: Math.round(this.state.stamina),
+      threatLevel,
+      activeBlightCount,
+      activeWispsCount,
+      blightPurified: this.state.blightPurified,
+      collapseCountdown,
+      worldSeed: this.state.worldSeed,
+      seedLabel: this.state.seedLabel,
+      biomePreset: this.state.biomePreset,
+      biomeLabel: biomeMeta.name,
+      distanceFromOrigin: Math.round(Math.hypot(this.playerX, this.playerZ)),
+      isNightThreat: isNight && (activeBlightCount > 0 || activeWispsCount > 0),
+      gameOver: this.state.gameOver,
       pulseCooldown: Math.max(0, Math.min(1, (this.pulseCooldownAt - this.state.simTime) / 6)),
       synergies: this.computeSynergies(),
       npcNeeds: this.computeNpcNeeds(),
+      npcPositions,
       npcMemories: this.state.npcMemories,
       buildings: [...this.state.buildings],
       completedQuests: [...this.state.completedQuests],
@@ -2861,6 +4523,7 @@ export class WorldEngine {
       ruinPillars: [...this.state.ruinPillars],
       cavernLit: this.state.cavernLit,
       communityProjects: { ...this.state.communityProjects },
+      achievements: this.getAchievementStates(),
       journal: [...this.state.journal],
       realPlan: this.state.realPlan,
       nearby: this.findNearbyPrompt(),
@@ -2880,6 +4543,22 @@ export class WorldEngine {
     window.removeEventListener('blur', this.handleBlur);
     window.removeEventListener('pointermove', this.handlePointerMove);
     window.removeEventListener('pointerup', this.handlePointerUp);
+
+    for (const chunk of this.frontierChunks.values()) {
+      this.disposeObjectTree(chunk.group);
+    }
+    this.frontierChunks.clear();
+    for (const bn of this.blightNodes.values()) {
+      this.disposeObjectTree(bn.group);
+    }
+    this.blightNodes.clear();
+    for (const w of this.shadowWisps) {
+      this.disposeObjectTree(w.group);
+    }
+    this.shadowWisps = [];
+    this.disposeObjectTree(this.staticPropsGroup);
+    this.disposeObjectTree(this.cloudGroup);
+    this.composer?.dispose();
 
     this.sound.dispose();
     this.tex.dispose();

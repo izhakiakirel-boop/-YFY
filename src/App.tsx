@@ -1,22 +1,66 @@
-import { useEffect, useRef, useState } from 'react';
+import { Component, type ErrorInfo, type ReactNode, useEffect, useRef, useState } from 'react';
 import { BottomDock } from './components/BottomDock';
 import { DialogueOverlay } from './components/DialogueOverlay';
+import { GameOverModal } from './components/GameOverModal';
 import { HelpModal } from './components/HelpModal';
 import { InspectModal } from './components/InspectModal';
 import { JournalModal } from './components/JournalModal';
 import { Minimap } from './components/Minimap';
+import { NewWorldModal } from './components/NewWorldModal';
 import { TopHud } from './components/TopHud';
 import { TouchControls } from './components/TouchControls';
 import { WorldEngine } from './game/WorldEngine';
-import type { BlueprintId, HudSnapshot, NpcId, ToastMessage } from './game/types';
+import type { AudioMixSettings, BlueprintId, HudSnapshot, NpcId, ToastMessage } from './game/types';
 
-export default function App() {
+class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; message: string }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, message: '' };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, message: error?.message || 'שגיאה לא צפויה בהפעלת העולם' };
+  }
+
+  componentDidCatch(_error: Error, _info: ErrorInfo) {
+    // Handled visibly in fallback UI
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="w-screen h-screen bg-[#08161a] text-[#edf6f2] flex items-center justify-center p-6 text-right">
+          <div className="hud-surface-elevated max-w-md w-full rounded-3xl p-6 space-y-3">
+            <h2 className="font-display text-lg font-bold text-[#f5b971]">אירעה שגיאה בטעינת העמק</h2>
+            <p className="text-xs text-[#cfe8e3] leading-relaxed">
+              נסה לרענן את הדף או לפתוח בדפדפן Chrome / Edge עדכני עם תמיכה ב-WebGL2.
+            </p>
+            <div className="text-[11px] font-mono-num text-[#9ec0bd] bg-black/30 rounded-xl p-2.5">
+              {this.state.message}
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function ValleyGameApp() {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<WorldEngine | null>(null);
 
   const [hud, setHud] = useState<HudSnapshot | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [audioOn, setAudioOn] = useState(false);
+  const [audioMix, setAudioMix] = useState<AudioMixSettings>({
+    muted: false,
+    musicVolume: 0.75,
+    ambienceVolume: 0.85,
+  });
   const [dockCollapsed, setDockCollapsed] = useState(false);
   const [activeBlueprint, setActiveBlueprint] = useState<BlueprintId | null>(null);
 
@@ -25,8 +69,10 @@ export default function App() {
   const [inspectProjectId, setInspectProjectId] = useState<string | null>(null);
   const [journalOpen, setJournalOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [newWorldOpen, setNewWorldOpen] = useState(false);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [downloadingHtml, setDownloadingHtml] = useState(false);
+  const [engineError, setEngineError] = useState<string | null>(null);
 
   const pushToast = (t: ToastMessage) => {
     setToasts((prev) => [...prev.slice(-2), t]);
@@ -37,6 +83,14 @@ export default function App() {
 
   const handleDownloadHtml = async () => {
     if (downloadingHtml) return;
+    if (window.location.protocol === 'file:') {
+      pushToast({
+        id: `dl_local_${Date.now()}`,
+        text: 'אתה כבר מריץ את קובץ ה-HTML העצמאי ישירות מהמחשב!',
+        tone: 'info',
+      });
+      return;
+    }
     setDownloadingHtml(true);
     try {
       const res = await fetch('/shozrim-olam-3d.html');
@@ -53,7 +107,7 @@ export default function App() {
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 5000);
       pushToast({
         id: `dl_${Date.now()}`,
         text: 'קובץ המשחק shozrim-olam-3d.html ירד בהצלחה!',
@@ -74,30 +128,37 @@ export default function App() {
     const el = mountRef.current;
     if (!el) return;
 
-    const engine = new WorldEngine(el, {
-      onHudUpdate: (snap) => setHud(snap),
-      onToast: (t) => pushToast(t),
-      onOpenNpc: (npcId) => setActiveNpc(npcId),
-      onInspectBuilding: (bId) => setInspectBuildingId(bId),
-      onOpenProject: (pId) => setInspectProjectId(pId),
-      onBuildModeChange: (bp) => setActiveBlueprint(bp),
-    });
+    let engine: WorldEngine | null = null;
+    try {
+      engine = new WorldEngine(el, {
+        onHudUpdate: (snap) => setHud(snap),
+        onToast: (t) => pushToast(t),
+        onOpenNpc: (npcId) => setActiveNpc(npcId),
+        onInspectBuilding: (bId) => setInspectBuildingId(bId),
+        onOpenProject: (pId) => setInspectProjectId(pId),
+        onBuildModeChange: (bp) => setActiveBlueprint(bp),
+        onAudioChange: (enabled) => setAudioOn(enabled),
+        onAudioMixChange: (mix) => setAudioMix(mix),
+      });
+      engineRef.current = engine;
+      setAudioMix(engine.getAudioMix());
 
-    engineRef.current = engine;
-
-    pushToast({
-      id: 'welcome',
-      text: 'ברוך הבא לעמק החי. שוטט ב-WASD, אסוף עם F, ושדר תהודה עם Q לגילוי סודות.',
-      tone: 'good',
-    });
+      pushToast({
+        id: 'welcome',
+        text: 'ברוך הבא לעמק החי. שוטט ב-WASD, אסוף עם F, ושדר תהודה עם Q לגילוי סודות.',
+        tone: 'good',
+      });
+    } catch (err) {
+      setEngineError(err instanceof Error ? err.message : 'שגיאה באתחול תצוגת התלת־ממד (WebGL)');
+    }
 
     return () => {
-      engine.dispose();
+      engine?.dispose();
       engineRef.current = null;
     };
   }, []);
 
-  // Pause simulation / focus camera when overlays are open
+  // Pause simulation / focus camera when overlays or game-over are open
   useEffect(() => {
     const anyModal = !!(
       activeNpc ||
@@ -105,10 +166,12 @@ export default function App() {
       inspectProjectId ||
       journalOpen ||
       helpOpen ||
-      resetConfirmOpen
+      newWorldOpen ||
+      resetConfirmOpen ||
+      hud?.gameOver
     );
     engineRef.current?.setDialogPaused(anyModal, activeNpc);
-  }, [activeNpc, inspectBuildingId, inspectProjectId, journalOpen, helpOpen, resetConfirmOpen]);
+  }, [activeNpc, inspectBuildingId, inspectProjectId, journalOpen, helpOpen, newWorldOpen, resetConfirmOpen, hud?.gameOver]);
 
   // Global H (Zen Mode) and Escape shortcuts
   useEffect(() => {
@@ -125,12 +188,13 @@ export default function App() {
         else if (inspectProjectId) setInspectProjectId(null);
         else if (journalOpen) setJournalOpen(false);
         else if (helpOpen) setHelpOpen(false);
+        else if (newWorldOpen) setNewWorldOpen(false);
         else if (resetConfirmOpen) setResetConfirmOpen(false);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [activeNpc, inspectBuildingId, inspectProjectId, journalOpen, helpOpen, resetConfirmOpen]);
+  }, [activeNpc, inspectBuildingId, inspectProjectId, journalOpen, helpOpen, newWorldOpen, resetConfirmOpen]);
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#08161a]">
@@ -141,20 +205,48 @@ export default function App() {
         aria-label="עולם משחק תלת-ממדי שוזרים עולם"
       />
 
+      {engineError && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#08161a] p-6 text-right">
+          <div className="hud-surface-elevated max-w-md w-full rounded-3xl p-6 space-y-3">
+            <h2 className="font-display text-lg font-bold text-[#f5b971]">לא ניתן להפעיל תלת־ממד בדפדפן זה</h2>
+            <p className="text-xs text-[#cfe8e3] leading-relaxed">
+              כדי להריץ את העמק התלת־ממדי נדרשת תמיכת WebGL2 פעילה בדפדפן (Chrome / Edge / Firefox עדכניים עם האצת חומרה פעילה).
+            </p>
+            <div className="text-[11px] font-mono-num text-[#9ec0bd] bg-black/30 rounded-xl p-2.5">
+              {engineError}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Low-HP crimson edge alert (pointer-events-none, no backdrop-filter) */}
+      {hud && hud.health < 35 && !hud.gameOver && (
+        <div
+          className="pointer-events-none fixed inset-0 z-10 transition-opacity duration-300"
+          style={{
+            boxShadow: 'inset 0 0 90px rgba(244, 63, 94, 0.45)',
+          }}
+        />
+      )}
+
       {/* Top Floating Telemetry & Controls */}
       {hud && (
         <TopHud
           hud={hud}
           audioOn={audioOn}
+          audioMix={audioMix}
           downloadingHtml={downloadingHtml}
           onToggleAudio={() => {
             const next = engineRef.current?.toggleAudio() ?? false;
             setAudioOn(next);
           }}
+          onChangeMusicVolume={(vol) => engineRef.current?.setMusicVolume(vol)}
+          onChangeAmbienceVolume={(vol) => engineRef.current?.setAmbienceVolume(vol)}
           onAdvanceTime={() => engineRef.current?.advanceTimeOfDay(3)}
           onDownloadHtml={handleDownloadHtml}
           onOpenJournal={() => setJournalOpen(true)}
           onOpenHelp={() => setHelpOpen(true)}
+          onOpenNewWorld={() => setNewWorldOpen(true)}
           onReset={() => setResetConfirmOpen(true)}
         />
       )}
@@ -251,6 +343,25 @@ export default function App() {
       {/* Guide Modal */}
       {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
 
+      {/* Procedural New World Generator Modal */}
+      {hud && newWorldOpen && (
+        <NewWorldModal
+          currentSeedLabel={hud.seedLabel}
+          currentBiome={hud.biomePreset}
+          onCreateWorld={(cfg) => engineRef.current?.generateNewWorld(cfg)}
+          onClose={() => setNewWorldOpen(false)}
+        />
+      )}
+
+      {/* Game Over / Defeat Modal */}
+      {hud && hud.gameOver && !newWorldOpen && (
+        <GameOverModal
+          gameOver={hud.gameOver}
+          onRetryWorld={() => engineRef.current?.retryCurrentWorld()}
+          onOpenNewWorld={() => setNewWorldOpen(true)}
+        />
+      )}
+
       {/* Reset World Confirmation */}
       {resetConfirmOpen && (
         <div
@@ -286,5 +397,13 @@ export default function App() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <ValleyGameApp />
+    </AppErrorBoundary>
   );
 }

@@ -1,4 +1,4 @@
-import { NPCS_BASE } from '../game/data';
+import { NPCS_BASE, VALLEY_BLIGHT_SPOTS } from '../game/data';
 import { riverCenterX, WORLD_HALF } from '../game/terrain';
 import type { HudSnapshot } from '../game/types';
 
@@ -19,8 +19,10 @@ export function Minimap({ hud, onNavigateTo }: MinimapProps) {
     riverPts.push(`${riverPts.length === 0 ? 'M' : 'L'} ${toMap(x).toFixed(1)} ${toMap(z).toFixed(1)}`);
   }
 
-  const px = toMap(hud.playerPos.x);
-  const pz = toMap(hud.playerPos.z);
+  const px = Math.max(6, Math.min(size - 6, toMap(hud.playerPos.x)));
+  const pz = Math.max(6, Math.min(size - 6, toMap(hud.playerPos.z)));
+  const isOutInFrontier =
+    Math.abs(hud.playerPos.x) > WORLD_HALF || Math.abs(hud.playerPos.z) > WORLD_HALF;
 
   return (
     <div className="pointer-events-auto fixed top-20 left-3 md:left-4 z-20 hidden sm:flex flex-col items-center gap-1">
@@ -44,6 +46,18 @@ export function Minimap({ hud, onNavigateTo }: MinimapProps) {
           {/* River */}
           <path d={riverPts.join(' ')} fill="none" stroke="#3da8c4" strokeWidth="6" strokeLinecap="round" />
 
+          {/* Valley Blight spots */}
+          {VALLEY_BLIGHT_SPOTS.map((spot) => (
+            <circle
+              key={spot.id}
+              cx={toMap(spot.x)}
+              cy={toMap(spot.z)}
+              r={3.5}
+              fill="#e8488a"
+              fillOpacity={hud.activeBlightCount > 0 ? 0.65 : 0.15}
+            />
+          ))}
+
           {/* Placed buildings */}
           {hud.buildings.map((b) => (
             <rect
@@ -57,11 +71,11 @@ export function Minimap({ hud, onNavigateTo }: MinimapProps) {
             />
           ))}
 
-          {/* NPCs */}
+          {/* Patrolling NPCs (live coordinates) */}
           {NPCS_BASE.map((n) => {
-            const need = hud.npcNeeds[n.id];
-            const nx = toMap(need ? need.focusX : n.homeX);
-            const nz = toMap(need ? need.focusZ : n.homeZ);
+            const livePos = hud.npcPositions?.[n.id];
+            const nx = toMap(livePos ? livePos.x : n.homeX);
+            const nz = toMap(livePos ? livePos.z : n.homeZ);
             return (
               <circle
                 key={n.id}
@@ -80,8 +94,10 @@ export function Minimap({ hud, onNavigateTo }: MinimapProps) {
             <polygon points="0,-6 4,4 0,2 -4,4" fill="#ffffff" stroke="#08161a" strokeWidth="1" />
           </g>
         </svg>
-        <div className="text-[10px] text-[#9ec0bd] text-center mt-1 font-medium">
-          מפת העמק · קליק לתנועה
+        <div className="text-[10px] text-[#9ec0bd] text-center mt-1 font-medium font-mono-num">
+          {isOutInFrontier
+            ? `מרחבי הספר · ${hud.distanceFromOrigin}מ'`
+            : 'מפת העמק · קליק לתנועה'}
         </div>
       </div>
     </div>

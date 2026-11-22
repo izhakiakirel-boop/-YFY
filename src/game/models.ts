@@ -261,14 +261,18 @@ export function createInventionGroup(
 
   const woodMat = new THREE.MeshStandardMaterial({
     map: tex.wood,
+    normalMap: tex.woodNormal,
+    normalScale: new THREE.Vector2(0.75, 0.75),
     color: tier === 3 ? 0xc28a59 : 0xaa7448,
-    roughness: 0.78,
+    roughness: 0.76,
     metalness: 0.05,
   });
   const stoneMat = new THREE.MeshStandardMaterial({
     map: tex.stone,
+    normalMap: tex.stoneNormal,
+    normalScale: new THREE.Vector2(0.95, 0.95),
     color: 0x899490,
-    roughness: 0.88,
+    roughness: 0.86,
     metalness: 0.06,
   });
   const brassMat = new THREE.MeshStandardMaterial({
@@ -719,23 +723,27 @@ export function createCottage(
 
   const stoneMat = new THREE.MeshStandardMaterial({
     map: tex.stone,
+    normalMap: tex.stoneNormal,
+    normalScale: new THREE.Vector2(0.95, 0.95),
     color: 0x878d86,
-    roughness: 0.9,
+    roughness: 0.88,
   });
   const wallMat = new THREE.MeshStandardMaterial({
     map: tex.plaster,
     color: 0xe6d9bf,
-    roughness: 0.85,
+    roughness: 0.84,
   });
   const roofMat = new THREE.MeshStandardMaterial({
     map: tex.roof,
     color: 0x8a584d,
-    roughness: 0.78,
+    roughness: 0.76,
   });
   const woodMat = new THREE.MeshStandardMaterial({
     map: tex.wood,
+    normalMap: tex.woodNormal,
+    normalScale: new THREE.Vector2(0.75, 0.75),
     color: 0x6f4b32,
-    roughness: 0.8,
+    roughness: 0.78,
   });
   const windowMat = new THREE.MeshStandardMaterial({
     color: 0xffe4a8,
@@ -815,8 +823,10 @@ export function createTreeGroup(
   const g = new THREE.Group();
   const trunkMat = new THREE.MeshStandardMaterial({
     map: tex.wood,
+    normalMap: tex.woodNormal,
+    normalScale: new THREE.Vector2(0.85, 0.85),
     color: kind === 'glowwillow' ? 0x5c5368 : 0x6b4b35,
-    roughness: 0.9,
+    roughness: 0.88,
   });
 
   const trunk = new THREE.Mesh(
@@ -827,6 +837,17 @@ export function createTreeGroup(
   trunk.castShadow = true;
   trunk.receiveShadow = true;
   g.add(trunk);
+
+  // Splayed organic root buttresses
+  for (let r = 0; r < 3; r++) {
+    const a = (r / 3) * Math.PI * 2 + 0.4;
+    const root = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.22, 0.95, 6), trunkMat);
+    root.position.set(Math.cos(a) * 0.34, 0.26, Math.sin(a) * 0.34);
+    root.rotation.z = Math.cos(a) * 0.65;
+    root.rotation.x = -Math.sin(a) * 0.65;
+    root.castShadow = true;
+    g.add(root);
+  }
 
   if (kind === 'pine') {
     const foliageMat = new THREE.MeshStandardMaterial({
@@ -1003,8 +1024,10 @@ export function createRuinPillarGroup(tex: ProceduralTexturePack): THREE.Group {
   const g = new THREE.Group();
   const stoneMat = new THREE.MeshStandardMaterial({
     map: tex.stone,
+    normalMap: tex.stoneNormal,
+    normalScale: new THREE.Vector2(1.0, 1.0),
     color: 0x7b8685,
-    roughness: 0.88,
+    roughness: 0.86,
   });
   const base = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.7, 2.2), stoneMat);
   base.position.y = 0.35;
@@ -1074,3 +1097,184 @@ export function createDeerGroup(): THREE.Group {
 
   return g;
 }
+
+export function createShadowWispGroup(): THREE.Group {
+  const g = new THREE.Group();
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: 0x1e132b,
+    emissive: 0x4b1259,
+    emissiveIntensity: 0.75,
+    roughness: 0.35,
+    metalness: 0.45,
+  });
+  const eyeMat = new THREE.MeshStandardMaterial({
+    color: 0xff5478,
+    emissive: 0xff2b59,
+    emissiveIntensity: 2.2,
+    roughness: 0.2,
+  });
+  const shardMat = new THREE.MeshStandardMaterial({
+    color: 0x2c1c3f,
+    emissive: 0x9b36ff,
+    emissiveIntensity: 0.9,
+    roughness: 0.25,
+    metalness: 0.6,
+  });
+
+  const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.62, 1), bodyMat);
+  core.position.y = 1.45;
+  core.castShadow = true;
+  g.add(core);
+
+  // Glowing twin eyes facing +Z
+  [-0.18, 0.18].forEach((ex) => {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.095, 8, 8), eyeMat);
+    eye.position.set(ex, 1.52, 0.52);
+    g.add(eye);
+  });
+
+  // Swirling shadow crown & orbiting obsidian blades
+  const orbit = new THREE.Group();
+  orbit.position.y = 1.45;
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 4) * Math.PI * 2;
+    const blade = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.82, 4), shardMat);
+    blade.position.set(Math.cos(a) * 0.92, Math.sin(i * 1.4) * 0.18, Math.sin(a) * 0.92);
+    blade.rotation.z = Math.PI * 0.85;
+    blade.rotation.y = a;
+    orbit.add(blade);
+  }
+  const halo = new THREE.Mesh(
+    new THREE.TorusGeometry(0.88, 0.05, 6, 20),
+    eyeMat,
+  );
+  halo.rotation.x = Math.PI / 2.2;
+  orbit.add(halo);
+
+  g.userData.orbit = orbit;
+  g.userData.core = core;
+  g.add(orbit);
+  return g;
+}
+
+export function createBlightNestGroup(tex: ProceduralTexturePack, purified: boolean): THREE.Group {
+  const g = new THREE.Group();
+  const baseMat = new THREE.MeshStandardMaterial({
+    map: tex.stone,
+    normalMap: tex.stoneNormal,
+    normalScale: new THREE.Vector2(1.0, 1.0),
+    color: purified ? 0x5c7d72 : 0x2b2235,
+    roughness: 0.9,
+  });
+
+  const mound = new THREE.Mesh(new THREE.CylinderGeometry(1.75, 2.55, 0.65, 8), baseMat);
+  mound.position.y = 0.32;
+  mound.receiveShadow = true;
+  mound.castShadow = true;
+  g.add(mound);
+
+  const fangMat = new THREE.MeshStandardMaterial({
+    color: purified ? 0x6ba68e : 0x35224a,
+    emissive: purified ? 0x1e5c45 : 0x3b0f4f,
+    emissiveIntensity: purified ? 0.3 : 0.7,
+    roughness: 0.5,
+  });
+
+  const fangs: THREE.Mesh[] = [];
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * Math.PI * 2;
+    const h = 2.1 + (i % 2) * 0.8;
+    const fang = new THREE.Mesh(new THREE.ConeGeometry(0.36, h, 5), fangMat);
+    fang.position.set(Math.cos(a) * 1.15, h * 0.45 + 0.3, Math.sin(a) * 1.15);
+    fang.rotation.z = -Math.cos(a) * 0.28;
+    fang.rotation.x = Math.sin(a) * 0.28;
+    fang.castShadow = true;
+    fangs.push(fang);
+    g.add(fang);
+  }
+
+  const orbMat = new THREE.MeshStandardMaterial({
+    color: purified ? 0x7ef2c9 : 0xe8488a,
+    emissive: purified ? 0x3ad49f : 0xc9266d,
+    emissiveIntensity: purified ? 1.1 : 1.85,
+    roughness: 0.18,
+    metalness: 0.3,
+  });
+  const orb = new THREE.Mesh(new THREE.OctahedronGeometry(0.58, 1), orbMat);
+  orb.position.y = 2.05;
+  g.add(orb);
+
+  const auraRing = new THREE.Mesh(
+    new THREE.RingGeometry(5.6, 6.2, 36),
+    new THREE.MeshBasicMaterial({
+      color: purified ? 0x7ef2c9 : 0xd9367a,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: purified ? 0.16 : 0.45,
+      depthWrite: false,
+    }),
+  );
+  auraRing.rotation.x = -Math.PI / 2;
+  auraRing.position.y = 0.12;
+  g.add(auraRing);
+
+  g.userData.orb = orb;
+  g.userData.orbMat = orbMat;
+  g.userData.fangMat = fangMat;
+  g.userData.auraRing = auraRing;
+  return g;
+}
+
+export function createMonolithGroup(tex: ProceduralTexturePack, accentHex = 0x88e9ff): THREE.Group {
+  const g = new THREE.Group();
+  const stoneMat = new THREE.MeshStandardMaterial({
+    map: tex.stone,
+    normalMap: tex.stoneNormal,
+    normalScale: new THREE.Vector2(1.0, 1.0),
+    color: 0x5c6870,
+    roughness: 0.88,
+  });
+  const plinth = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.7, 2.6), stoneMat);
+  plinth.position.y = 0.35;
+  plinth.castShadow = true;
+  plinth.receiveShadow = true;
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.95, 5.4, 5), stoneMat);
+  shaft.position.y = 3.2;
+  shaft.castShadow = true;
+  const runeBand = new THREE.Mesh(
+    new THREE.TorusGeometry(0.75, 0.07, 6, 16),
+    new THREE.MeshStandardMaterial({
+      color: accentHex,
+      emissive: accentHex,
+      emissiveIntensity: 1.2,
+      roughness: 0.2,
+    }),
+  );
+  runeBand.rotation.x = Math.PI / 2;
+  runeBand.position.y = 4.2;
+  g.add(plinth, shaft, runeBand);
+  return g;
+}
+
+export function createBoulderClusterGroup(tex: ProceduralTexturePack, tintHex = 0x6f7a76): THREE.Group {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({
+    map: tex.stone,
+    normalMap: tex.stoneNormal,
+    normalScale: new THREE.Vector2(1.0, 1.0),
+    color: tintHex,
+    roughness: 0.92,
+  });
+  const main = new THREE.Mesh(new THREE.DodecahedronGeometry(1.45, 1), mat);
+  main.scale.set(1.2, 0.85, 1.0);
+  main.position.y = 0.75;
+  main.castShadow = true;
+  main.receiveShadow = true;
+  const side = new THREE.Mesh(new THREE.DodecahedronGeometry(0.85, 0), mat);
+  side.position.set(1.1, 0.45, 0.55);
+  side.castShadow = true;
+  side.receiveShadow = true;
+  g.add(main, side);
+  return g;
+}
+
