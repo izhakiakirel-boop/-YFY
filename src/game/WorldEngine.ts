@@ -9,26 +9,44 @@ import {
   ACHIEVEMENTS,
   BIOME_PRESETS,
   BLUEPRINTS,
+  CLIMATE_EVENT_LABELS,
   COMMUNITY_PROJECTS_DATA,
+  CRAFT_ITEMS,
+  CRAFT_RECIPES,
   INITIAL_SECRETS,
   NPC_PATROL_ROUTES,
   NPCS_BASE,
   RESOURCES,
+  SEASON_LENGTH_DAYS,
+  SEASON_ORDER,
+  SEASONS,
+  SUB_BIOMES,
   VALLEY_BLIGHT_SPOTS,
   ZONES,
 } from './data';
 import {
+  createAncientTempleGroup,
   createBlightNestGroup,
   createBoulderClusterGroup,
   createCharacterRig,
   createCottage,
+  createCrystalSpireCluster,
   createDeerGroup,
+  createFloatingSkyIsleGroup,
+  createForageItemMesh,
+  createFoxGroup,
+  createGiantMushroomGroup,
   createInventionGroup,
+  createMeteorStreakGroup,
   createMonolithGroup,
   createResourceNodeMesh,
   createRuinPillarGroup,
   createShadowWispGroup,
+  createStoneCircleGroup,
+  createTeleportPortalGroup,
+  createThermalSpringGroup,
   createTreeGroup,
+  createUpdraftVortexGroup,
   type CharacterRig,
 } from './models';
 import {
@@ -36,15 +54,20 @@ import {
   CHUNK_SIZE,
   chunkSeedHash,
   createSeededRng,
+  detectSubBiome,
   detectZone,
   FORD_Z,
+  getSkyIsleForChunk,
+  getThermalSpringForChunk,
   groundHeightAt,
   ISLAND_BRIDGE_POS,
+  isInThermalSpringPool,
   isWalkableWater,
   MAIN_BRIDGE_POS,
   riverCenterX,
   riverHalfWidth,
   setActiveWorldConfig,
+  skyPlatformHeightAt,
   terrainSlopeAt,
   WATER_LEVEL,
   WORLD_HALF,
@@ -56,16 +79,25 @@ import type {
   BiomePresetId,
   BlightNodeState,
   BlueprintId,
+  ClimateEventType,
+  CraftInventory,
+  CraftItemId,
   GameState,
   HudSnapshot,
+  LandmarkKind,
+  LandmarkRecord,
   NearbyPrompt,
   NpcId,
   NpcMemory,
   NpcNeedState,
   PlacedBuilding,
+  PortalDestination,
+  ProximityItemNode,
   RealActionPlan,
   ResourceInventory,
   ResourceType,
+  SeasonId,
+  SubBiomeId,
   SynergyLink,
   ToastMessage,
   WeatherType,
@@ -97,6 +129,7 @@ export interface EngineCallbacks {
   onBuildModeChange: (bp: BlueprintId | null) => void;
   onAudioChange?: (enabled: boolean) => void;
   onAudioMixChange?: (mix: AudioMixSettings) => void;
+  onOpenPortal?: (portals: PortalDestination[]) => void;
 }
 
 function defaultNpcMemories(): Record<NpcId, NpcMemory> {
@@ -152,6 +185,30 @@ function defaultNpcMemories(): Record<NpcId, NpcMemory> {
   };
 }
 
+function defaultCraftInv(): CraftInventory {
+  return {
+    berry: 2,
+    mushroom: 1,
+    herb: 1,
+    spice_root: 0,
+    dew_flask: 2,
+    honey_sap: 0,
+    ember_stone: 0,
+    frost_crystal: 0,
+    cloth_fiber: 0,
+    star_shard: 0,
+    trail_jam: 0,
+    berry_skewer: 0,
+    spiced_tea: 0,
+    mint_cooler: 0,
+    frost_nectar: 0,
+    hearth_stew: 0,
+    healing_salve: 0,
+    thermal_cloak: 0,
+    star_elixir: 0,
+  };
+}
+
 function createFreshState(
   worldSeed = 104729,
   seedLabel = '104729',
@@ -163,11 +220,23 @@ function createFreshState(
     seedLabel,
     biomePreset,
     inv: { wood: 4, glow: 2, water: 2, rune: 0, seed: 0 },
+    craftInv: defaultCraftInv(),
+    autoSurvivalEnabled: true,
+    hasThermalCloak: false,
+    starBuffUntil: 0,
+    hunger: 92,
+    thirst: 92,
+    warmth: 88,
     completedQuests: [],
     promises: [],
     npcMemories: defaultNpcMemories(),
     buildings: [],
     discoveredSecrets: [],
+    discoveredPortals: [],
+    activatedLandmarks: [],
+    visitedSubBiomes: ['valley_core'],
+    recipesCraftedCount: 0,
+    meteorsHarvested: 0,
     ruinPillars: [false, false, false],
     cavernLit: false,
     communityProjects: {
@@ -186,7 +255,7 @@ function createFreshState(
     journal: [
       {
         id: 'j_init',
-        text: `הגעת אל ${biomeName} (זרע ${seedLabel}). נבגי קמילה מאיימים על האיזון — חקור, בנה וטהר בעזרת תהודה (Q).`,
+        text: `הגעת אל ${biomeName} (זרע ${seedLabel}). העונות מתחלפות כל ${SEASON_LENGTH_DAYS} ימים — אסוף פריטים משתלבים ושרוד עד החורף!`,
         kind: 'discovery',
         day: 1,
       },
@@ -196,6 +265,8 @@ function createFreshState(
     simTime: 75, // Start in crisp morning light!
     day: 1,
     weather: 'breeze',
+    climateEvent: 'none',
+    climateEventEndsAt: 0,
     playerPos: { x: -12, z: 2 },
     stamina: 100,
     tutorialSeen: false,
@@ -254,9 +325,39 @@ export class WorldEngine {
       obstacles: Array<{ x: number; z: number; r: number }>;
       resourceIds: string[];
       blightIds: string[];
+      landmarkIds: string[];
+      subBiome: SubBiomeId;
     }
   >();
   private lastChunkKey = '';
+  private lastSeasonId: SeasonId = 'spring';
+  private lastSubBiomeId: SubBiomeId = 'valley_core';
+  private ambientTempC = 19;
+
+  // Dynamic Survival, Proximity Forage, Landmarks, Sky Updrafts, Climate Meteors
+  private proximityItems: Array<{ node: ProximityItemNode; mesh: THREE.Group }> = [];
+  private chunkLandmarks = new Map<string, LandmarkRecord>();
+  private landmarkMeshes = new Map<string, THREE.Group>();
+  private skyUpdrafts: Array<{ x: number; z: number; deckY: number; chunkKey: string }> = [];
+  private foxList: Array<{ group: THREE.Group; x: number; z: number; yaw: number; phase: number }> = [];
+  private fallingMeteors: Array<{
+    mesh: THREE.Group;
+    x: number;
+    y: number;
+    z: number;
+    vx: number;
+    vy: number;
+    vz: number;
+    targetX: number;
+    targetZ: number;
+  }> = [];
+  private snowPoints!: THREE.Points;
+  private nextClimateEventAt = 95;
+  private nextMeteorAt = 0;
+  private lastRiverDrinkAt = -20;
+  private lastAutoSurviveAt = -20;
+  private lastSurvivalWarnAt = -30;
+  private lastUpdraftAt = -5;
 
   // Player & Controls
   private state: GameState;
@@ -386,8 +487,10 @@ export class WorldEngine {
     this.buildWildlifeAndParticles();
     this.syncBuildingsToScene();
     this.syncProjectsToScene();
+    this.lastSeasonId = this.getSeasonInfo(this.state.day).seasonId;
     this.updateFrontierChunks(true);
     this.updateTerrainVitalityColors();
+    this.stepProximityItems(true);
     this.evaluateAchievements(false);
     this.bindEvents();
 
@@ -414,15 +517,36 @@ export class WorldEngine {
         ...base,
         ...parsed,
         inv: { ...base.inv, ...(parsed.inv || {}) },
+        craftInv: { ...base.craftInv, ...(parsed.craftInv || {}) },
+        autoSurvivalEnabled:
+          typeof parsed.autoSurvivalEnabled === 'boolean' ? parsed.autoSurvivalEnabled : true,
+        hasThermalCloak: Boolean(parsed.hasThermalCloak),
+        starBuffUntil: typeof parsed.starBuffUntil === 'number' ? parsed.starBuffUntil : 0,
+        hunger: typeof parsed.hunger === 'number' ? Math.max(0, Math.min(100, parsed.hunger)) : 92,
+        thirst: typeof parsed.thirst === 'number' ? Math.max(0, Math.min(100, parsed.thirst)) : 92,
+        warmth: typeof parsed.warmth === 'number' ? Math.max(0, Math.min(100, parsed.warmth)) : 88,
+        discoveredPortals: Array.isArray(parsed.discoveredPortals) ? parsed.discoveredPortals : [],
+        activatedLandmarks: Array.isArray(parsed.activatedLandmarks) ? parsed.activatedLandmarks : [],
+        visitedSubBiomes:
+          Array.isArray(parsed.visitedSubBiomes) && parsed.visitedSubBiomes.length > 0
+            ? (parsed.visitedSubBiomes as SubBiomeId[])
+            : ['valley_core'],
+        recipesCraftedCount:
+          typeof parsed.recipesCraftedCount === 'number' ? parsed.recipesCraftedCount : 0,
+        meteorsHarvested: typeof parsed.meteorsHarvested === 'number' ? parsed.meteorsHarvested : 0,
+        climateEvent: parsed.climateEvent || 'none',
+        climateEventEndsAt:
+          typeof parsed.climateEventEndsAt === 'number' ? parsed.climateEventEndsAt : 0,
         npcMemories: { ...base.npcMemories, ...(parsed.npcMemories || {}) },
         communityProjects: { ...base.communityProjects, ...(parsed.communityProjects || {}) },
         unlockedAchievements:
           parsed.unlockedAchievements && typeof parsed.unlockedAchievements === 'object'
             ? parsed.unlockedAchievements
             : {},
-        visitedZones: Array.isArray(parsed.visitedZones) && parsed.visitedZones.length > 0
-          ? (parsed.visitedZones as ZoneId[])
-          : ['plaza'],
+        visitedZones:
+          Array.isArray(parsed.visitedZones) && parsed.visitedZones.length > 0
+            ? (parsed.visitedZones as ZoneId[])
+            : ['plaza'],
         pulsesTriggered: typeof parsed.pulsesTriggered === 'number' ? parsed.pulsesTriggered : 0,
         purifiedBlightIds: Array.isArray(parsed.purifiedBlightIds) ? parsed.purifiedBlightIds : [],
         blightPurified: typeof parsed.blightPurified === 'number' ? parsed.blightPurified : 0,
@@ -431,7 +555,10 @@ export class WorldEngine {
         gameOver: parsed.gameOver ?? null,
         buildings: Array.isArray(parsed.buildings) ? parsed.buildings : [],
         discoveredSecrets: Array.isArray(parsed.discoveredSecrets) ? parsed.discoveredSecrets : [],
-        ruinPillars: Array.isArray(parsed.ruinPillars) && parsed.ruinPillars.length === 3 ? parsed.ruinPillars : [false, false, false],
+        ruinPillars:
+          Array.isArray(parsed.ruinPillars) && parsed.ruinPillars.length === 3
+            ? parsed.ruinPillars
+            : [false, false, false],
         promises: Array.isArray(parsed.promises) ? parsed.promises : [],
         journal: Array.isArray(parsed.journal) ? parsed.journal : base.journal,
       };
@@ -695,8 +822,23 @@ export class WorldEngine {
     };
   }
 
+  private getSeasonInfo(day = this.state.day): {
+    seasonId: SeasonId;
+    dayInSeason: number;
+    year: number;
+  } {
+    const d0 = Math.max(0, day - 1);
+    const seasonIndex = Math.floor(d0 / SEASON_LENGTH_DAYS) % SEASON_ORDER.length;
+    const seasonId = SEASON_ORDER[seasonIndex];
+    const dayInSeason = (d0 % SEASON_LENGTH_DAYS) + 1;
+    const year = 1 + Math.floor(d0 / (SEASON_LENGTH_DAYS * SEASON_ORDER.length));
+    return { seasonId, dayInSeason, year };
+  }
+
   private sampleBaseTerrainColor(x: number, z: number, y: number, out: THREE.Color): void {
     const biome = BIOME_PRESETS[this.state.biomePreset];
+    const radial = Math.hypot(x, z);
+    const subBiome = detectSubBiome(x, z);
     const distRiver = Math.abs(x - riverCenterX(z)) - riverHalfWidth(z);
     const onTerrace = Math.hypot(x + 62, z - 54) < 30;
     const inRuins = Math.hypot(x + 66, z + 62) < 20;
@@ -716,16 +858,23 @@ export class WorldEngine {
       out.setHex(0x8b8669);
     } else if (onTerrace && this.state.biomePreset === 'verdant') {
       out.setHex(0xb99162);
-    } else if (x > 26 && Math.hypot(x, z) < 120) {
+    } else if (x > 26 && radial < 120) {
       out.setHex(biome.forestHex);
     } else {
       out.setHex(biome.grassHex);
     }
 
+    // Smoothly blend Frontier sub-biome soil/flora palette
+    if (radial > 106 && subBiome !== 'valley_core' && y >= WATER_LEVEL + 0.12) {
+      const subMix = Math.min(1, (radial - 106) / 30);
+      _colC.setHex(SUB_BIOMES[subBiome].groundHex);
+      out.lerp(_colC, subMix * 0.85);
+    }
+
     // Blend steep rocky cliffs & high ridges into weathered stone strata
     if (slope > 0.45 || y > 5.5) {
       const rockMix = Math.min(0.88, Math.max((slope - 0.45) * 1.15, (y - 5.5) * 0.12));
-      _colC.setHex(biome.rockHex);
+      _colC.setHex(subBiome === 'obsidian_crags' ? 0x2f2c38 : biome.rockHex);
       out.lerp(_colC, rockMix);
     }
 
@@ -773,20 +922,66 @@ export class WorldEngine {
     this.scene.add(this.terrainMesh);
   }
 
+  private applySeasonTintToColor(
+    x: number,
+    z: number,
+    y: number,
+    baseR: number,
+    baseG: number,
+    baseB: number,
+    seasonId: SeasonId,
+    blizzardActive: boolean,
+  ): [number, number, number] {
+    if (y <= WATER_LEVEL + 0.1) return [baseR, baseG, baseB];
+    const season = SEASONS[seasonId];
+    _colA.setRGB(baseR, baseG, baseB);
+
+    if (seasonId === 'autumn') {
+      _colB.setHex(0xb87b40);
+      _colA.lerp(_colB, 0.34);
+    } else if (seasonId === 'summer') {
+      _colB.setHex(0x7ca649);
+      _colA.lerp(_colB, 0.18);
+    } else if (seasonId === 'spring') {
+      _colB.setHex(0x52ad68);
+      _colA.lerp(_colB, 0.14);
+    }
+
+    const snowFactor = Math.min(1, season.snowLevel + (blizzardActive ? 0.25 : 0));
+    if (snowFactor > 0.02) {
+      const slope = terrainSlopeAt(x, z);
+      const flatSnow = Math.max(0, 1 - slope * 0.9);
+      const snowMix = Math.min(0.88, snowFactor * (0.45 + flatSnow * 0.55));
+      _colB.setHex(0xddecf5);
+      _colA.lerp(_colB, snowMix);
+    }
+
+    return [_colA.r, _colA.g, _colA.b];
+  }
+
   private updateTerrainVitalityColors(): void {
     const pos = this.terrainGeo.attributes.position;
     const colAttr = this.terrainGeo.attributes.color as THREE.BufferAttribute;
     const arr = colAttr.array as Float32Array;
     const irrigators = this.state.buildings.filter((b) => b.type === 'irrigator');
     const activeBlights = Array.from(this.blightNodes.values()).filter((bn) => !bn.purified);
+    const { seasonId } = this.getSeasonInfo();
+    const blizzardActive = this.state.climateEvent === 'blizzard';
 
     for (let i = 0; i < pos.count; i++) {
-      let r = this.baseTerrainColors[i * 3];
-      let g = this.baseTerrainColors[i * 3 + 1];
-      let b = this.baseTerrainColors[i * 3 + 2];
       const x = pos.getX(i);
       const z = pos.getZ(i);
       const y = pos.getY(i);
+      let [r, g, b] = this.applySeasonTintToColor(
+        x,
+        z,
+        y,
+        this.baseTerrainColors[i * 3],
+        this.baseTerrainColors[i * 3 + 1],
+        this.baseTerrainColors[i * 3 + 2],
+        seasonId,
+        blizzardActive,
+      );
 
       if (irrigators.length > 0 && y > WATER_LEVEL + 0.1) {
         let maxBloom = 0;
@@ -832,6 +1027,38 @@ export class WorldEngine {
       arr[i * 3 + 2] = b;
     }
     colAttr.needsUpdate = true;
+
+    // Also re-tint loaded frontier chunks smoothly for seasonal shifts
+    for (const chunk of this.frontierChunks.values()) {
+      const geo = chunk.terrainMesh.geometry;
+      const cPos = geo.attributes.position;
+      const cCol = geo.attributes.color as THREE.BufferAttribute;
+      const baseArr = geo.userData.baseColors as Float32Array | undefined;
+      if (!cCol || !baseArr) continue;
+      const cArr = cCol.array as Float32Array;
+      const cx0 = chunk.cx * CHUNK_SIZE;
+      const cz0 = chunk.cz * CHUNK_SIZE;
+      for (let i = 0; i < cPos.count; i++) {
+        const wx = cx0 + cPos.getX(i);
+        const wz = cz0 + cPos.getZ(i);
+        const wy = cPos.getY(i);
+        const [r, g, b] = this.applySeasonTintToColor(
+          wx,
+          wz,
+          wy,
+          baseArr[i * 3],
+          baseArr[i * 3 + 1],
+          baseArr[i * 3 + 2],
+          seasonId,
+          blizzardActive,
+        );
+        cArr[i * 3] = r;
+        cArr[i * 3 + 1] = g;
+        cArr[i * 3 + 2] = b;
+      }
+      cCol.needsUpdate = true;
+    }
+
     this.terrainNeedsColorUpdate = false;
   }
 
@@ -1560,10 +1787,22 @@ export class WorldEngine {
             this.pulseHighlights = this.pulseHighlights.filter((h) => h.id !== `blight_${bid}`);
           }
         }
+        for (const lid of chunk.landmarkIds) {
+          const lm = this.landmarkMeshes.get(lid);
+          if (lm) {
+            this.scene.remove(lm);
+            this.disposeObjectTree(lm);
+            this.landmarkMeshes.delete(lid);
+          }
+          this.chunkLandmarks.delete(lid);
+          this.pulseHighlights = this.pulseHighlights.filter((h) => h.id !== lid);
+        }
+        this.skyUpdrafts = this.skyUpdrafts.filter((u) => u.chunkKey !== k);
         this.frontierChunks.delete(k);
       }
     }
 
+    let builtAny = false;
     for (let cx = pcx - keepRadius; cx <= pcx + keepRadius; cx++) {
       for (let cz = pcz - keepRadius; cz <= pcz + keepRadius; cz++) {
         // Inner hero [-120..120] covers cx in [-1, 1] && cz in [-1, 1]
@@ -1571,8 +1810,12 @@ export class WorldEngine {
         const cKey = `${cx}_${cz}`;
         if (!this.frontierChunks.has(cKey)) {
           this.buildFrontierChunk(cx, cz, cKey);
+          builtAny = true;
         }
       }
+    }
+    if (builtAny) {
+      this.terrainNeedsColorUpdate = true;
     }
   }
 
@@ -1581,11 +1824,15 @@ export class WorldEngine {
     const centerZ = cz * CHUNK_SIZE;
     const group = new THREE.Group();
     const biome = BIOME_PRESETS[this.state.biomePreset];
+    const subBiome = detectSubBiome(centerX, centerZ);
+    const { seasonId } = this.getSeasonInfo();
+    const blizzardActive = this.state.climateEvent === 'blizzard';
 
     // Exact 2.0m grid (80 / 40) matching central terrain edge seamlessly
     const geo = new THREE.PlaneGeometry(CHUNK_SIZE, CHUNK_SIZE, 40, 40);
     geo.rotateX(-Math.PI / 2);
     const pos = geo.attributes.position;
+    const baseColors = new Float32Array(pos.count * 3);
     const colors = new Float32Array(pos.count * 3);
     for (let i = 0; i < pos.count; i++) {
       const lx = pos.getX(i);
@@ -1595,10 +1842,24 @@ export class WorldEngine {
       const wy = groundHeightAt(wx, wz);
       pos.setY(i, wy);
       this.sampleBaseTerrainColor(wx, wz, wy, _colA);
-      colors[i * 3] = _colA.r;
-      colors[i * 3 + 1] = _colA.g;
-      colors[i * 3 + 2] = _colA.b;
+      baseColors[i * 3] = _colA.r;
+      baseColors[i * 3 + 1] = _colA.g;
+      baseColors[i * 3 + 2] = _colA.b;
+      const [tr, tg, tb] = this.applySeasonTintToColor(
+        wx,
+        wz,
+        wy,
+        _colA.r,
+        _colA.g,
+        _colA.b,
+        seasonId,
+        blizzardActive,
+      );
+      colors[i * 3] = tr;
+      colors[i * 3 + 1] = tg;
+      colors[i * 3 + 2] = tb;
     }
+    geo.userData.baseColors = baseColors;
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geo.computeVertexNormals();
 
@@ -1622,9 +1883,58 @@ export class WorldEngine {
     const obstacles: Array<{ x: number; z: number; r: number }> = [];
     const resourceIds: string[] = [];
     const blightIds: string[] = [];
+    const landmarkIds: string[] = [];
 
-    // Trees & Rock Boulders
-    const treeBudget = this.state.biomePreset === 'arid_winds' ? 5 : 10;
+    // 1. Sub-biome-specific flora & geological formations
+    if (subBiome === 'crystal_canyon') {
+      for (let i = 0; i < 6; i++) {
+        const wx = centerX + (rng() - 0.5) * (CHUNK_SIZE - 12);
+        const wz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 12);
+        const wy = groundHeightAt(wx, wz);
+        if (wy < WATER_LEVEL + 0.35) continue;
+        const spire = createCrystalSpireCluster(i % 2 === 0 ? 0x88e9ff : 0xc9a6ff);
+        spire.position.set(wx, wy - 0.1, wz);
+        spire.rotation.y = rng() * TAU;
+        group.add(spire);
+        obstacles.push({ x: wx, z: wz, r: 1.5 });
+      }
+    } else if (subBiome === 'mushroom_grove') {
+      for (let i = 0; i < 7; i++) {
+        const wx = centerX + (rng() - 0.5) * (CHUNK_SIZE - 12);
+        const wz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 12);
+        const wy = groundHeightAt(wx, wz);
+        if (wy < WATER_LEVEL + 0.4) continue;
+        const capHex = i % 3 === 0 ? 0xf29eb9 : i % 3 === 1 ? 0x7ef2c9 : 0xb4a3ff;
+        const mush = createGiantMushroomGroup(capHex);
+        const sc = 0.75 + rng() * 0.7;
+        mush.position.set(wx, wy - 0.1, wz);
+        mush.scale.setScalar(sc);
+        group.add(mush);
+        obstacles.push({ x: wx, z: wz, r: 0.7 * sc });
+      }
+    } else if (subBiome === 'obsidian_crags') {
+      for (let i = 0; i < 6; i++) {
+        const wx = centerX + (rng() - 0.5) * (CHUNK_SIZE - 12);
+        const wz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 12);
+        const wy = groundHeightAt(wx, wz);
+        if (wy < WATER_LEVEL + 0.3) continue;
+        const crag = createCrystalSpireCluster(0xff6e4a);
+        crag.position.set(wx, wy - 0.15, wz);
+        crag.scale.set(1.15, 0.85 + rng() * 0.6, 1.15);
+        group.add(crag);
+        obstacles.push({ x: wx, z: wz, r: 1.5 });
+      }
+    }
+
+    // 2. Trees & Rock Boulders
+    const treeBudget =
+      subBiome === 'obsidian_crags' || subBiome === 'crystal_canyon'
+        ? 4
+        : subBiome === 'bloom_meadow'
+          ? 12
+          : this.state.biomePreset === 'arid_winds'
+            ? 5
+            : 9;
     for (let i = 0; i < treeBudget; i++) {
       const wx = centerX + (rng() - 0.5) * (CHUNK_SIZE - 8);
       const wz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 8);
@@ -1632,13 +1942,15 @@ export class WorldEngine {
       if (wy < WATER_LEVEL + 0.5 || terrainSlopeAt(wx, wz) > 0.6) continue;
       if (Math.abs(wx - riverCenterX(wz)) < riverHalfWidth(wz) + 3) continue;
       const kind =
-        this.state.biomePreset === 'mystic_night'
-          ? rng() > 0.45
+        subBiome === 'mushroom_grove' || this.state.biomePreset === 'mystic_night'
+          ? rng() > 0.4
             ? 'glowwillow'
             : 'pine'
-          : rng() > 0.5
-            ? 'pine'
-            : 'oak';
+          : subBiome === 'bloom_meadow'
+            ? 'oak'
+            : rng() > 0.5
+              ? 'pine'
+              : 'oak';
       const scale = 0.85 + rng() * 0.65;
       const tree = createTreeGroup(kind, this.tex, scale);
       tree.position.set(wx, wy - 0.1, wz);
@@ -1652,7 +1964,10 @@ export class WorldEngine {
       const wz = centerZ + (rng() - 0.5) * (CHUNK_SIZE - 10);
       const wy = groundHeightAt(wx, wz);
       if (wy < WATER_LEVEL + 0.35) continue;
-      const boulder = createBoulderClusterGroup(this.tex, biome.rockHex);
+      const boulder = createBoulderClusterGroup(
+        this.tex,
+        subBiome === 'obsidian_crags' ? 0x3a3742 : biome.rockHex,
+      );
       boulder.position.set(wx, wy - 0.15, wz);
       boulder.rotation.y = rng() * TAU;
       boulder.scale.setScalar(0.85 + rng() * 0.75);
@@ -1660,8 +1975,106 @@ export class WorldEngine {
       obstacles.push({ x: wx, z: wz, r: 1.6 });
     }
 
-    // Occasional Ancient Frontier Monolith
-    if (rng() < 0.38) {
+    // 3. Thermal Spring Geothermal Pool
+    const spring = getThermalSpringForChunk(cx, cz);
+    if (spring) {
+      const spY = groundHeightAt(spring.x, spring.z);
+      if (spY > WATER_LEVEL + 0.25) {
+        const spMesh = createThermalSpringGroup(this.tex, spring.radius);
+        spMesh.position.set(spring.x, spY + 0.04, spring.z);
+        group.add(spMesh);
+      }
+    }
+
+    // 4. Floating Sky Isle + Updraft Wind Vortex + Elevated Treasure
+    const skyIsle = getSkyIsleForChunk(cx, cz);
+    if (skyIsle) {
+      const isleMesh = createFloatingSkyIsleGroup(this.tex, skyIsle.radius);
+      isleMesh.position.set(skyIsle.x, skyIsle.deckY, skyIsle.z);
+      group.add(isleMesh);
+
+      const upY = groundHeightAt(skyIsle.updraftX, skyIsle.updraftZ);
+      const vortex = createUpdraftVortexGroup();
+      vortex.position.set(skyIsle.updraftX, upY, skyIsle.updraftZ);
+      group.add(vortex);
+
+      this.skyUpdrafts.push({
+        x: skyIsle.updraftX,
+        z: skyIsle.updraftZ,
+        deckY: skyIsle.deckY,
+        chunkKey: cKey,
+      });
+
+      // Spawn a rare star_shard / frost_crystal right on top of the sky isle
+      const rareId = `sky_item_${cKey}`;
+      if (!this.proximityItems.some((p) => p.node.id === rareId)) {
+        const itemId: CraftItemId = rng() > 0.4 ? 'star_shard' : 'frost_crystal';
+        const mesh = createForageItemMesh(itemId);
+        mesh.position.set(skyIsle.x, skyIsle.deckY, skyIsle.z);
+        this.scene.add(mesh);
+        this.proximityItems.push({
+          node: { id: rareId, itemId, x: skyIsle.x, y: skyIsle.deckY, z: skyIsle.z, isMeteorDrop: true },
+          mesh,
+        });
+      }
+    }
+
+    // 5. Random Ancient Landmark (Ancient Temple, Stone Circle, or Fast-Travel Portal)
+    const landmarkRoll = rng();
+    if (landmarkRoll < 0.42) {
+      const lx = centerX + (rng() - 0.5) * 32;
+      const lz = centerZ + (rng() - 0.5) * 32;
+      const ly = groundHeightAt(lx, lz);
+      if (ly > WATER_LEVEL + 0.45 && terrainSlopeAt(lx, lz) < 0.6) {
+        const lid = `lm_${cKey}`;
+        const kind: LandmarkKind =
+          landmarkRoll < 0.14 ? 'portal' : landmarkRoll < 0.28 ? 'ancient_temple' : 'stone_circle';
+        const activated =
+          kind === 'portal'
+            ? this.state.discoveredPortals.some((p) => p.id === lid)
+            : this.state.activatedLandmarks.includes(lid);
+        const lmName =
+          kind === 'portal'
+            ? `שער ${SUB_BIOMES[subBiome].name}`
+            : kind === 'ancient_temple'
+              ? `מקדש ${SUB_BIOMES[subBiome].name}`
+              : `מעגל אבנים עתיק`;
+
+        const lmMesh =
+          kind === 'portal'
+            ? createTeleportPortalGroup(this.tex, activated)
+            : kind === 'ancient_temple'
+              ? createAncientTempleGroup(this.tex, activated)
+              : createStoneCircleGroup(this.tex, activated);
+        lmMesh.position.set(lx, ly, lz);
+        lmMesh.rotation.y = rng() * TAU;
+        this.scene.add(lmMesh);
+
+        const rec: LandmarkRecord = {
+          id: lid,
+          kind,
+          name: lmName,
+          subBiome,
+          x: lx,
+          z: lz,
+          activated,
+          chunkKey: cKey,
+        };
+        this.chunkLandmarks.set(lid, rec);
+        this.landmarkMeshes.set(lid, lmMesh);
+        landmarkIds.push(lid);
+        this.registerPulseHighlight(
+          lid,
+          'secret',
+          lmMesh,
+          kind === 'portal' ? 0x88e9ff : 0xffcb77,
+          2.6,
+          6.0,
+          () => ({ x: lx, z: lz }),
+          () => kind === 'portal' || !rec.activated,
+        );
+      }
+    } else if (rng() < 0.38) {
       const mx = centerX + (rng() - 0.5) * 32;
       const mz = centerZ + (rng() - 0.5) * 32;
       const my = groundHeightAt(mx, mz);
@@ -1674,7 +2087,7 @@ export class WorldEngine {
       }
     }
 
-    // Seeded Frontier Resource Nodes
+    // 6. Seeded Frontier Resource Nodes
     const resTypes: ResourceType[] = ['wood', 'glow', 'water', 'rune', 'seed'];
     const resCount = 2 + Math.floor(rng() * 2);
     for (let i = 0; i < resCount; i++) {
@@ -1711,7 +2124,7 @@ export class WorldEngine {
       );
     }
 
-    // Procedural Frontier Blight Nest in wild chunks (~48% chance)
+    // 7. Procedural Frontier Blight Nest in wild chunks (~48% chance)
     if (rng() < 0.48) {
       const bx = centerX + (rng() - 0.5) * 40;
       const bz = centerZ + (rng() - 0.5) * 40;
@@ -1732,6 +2145,8 @@ export class WorldEngine {
       obstacles,
       resourceIds,
       blightIds,
+      landmarkIds,
+      subBiome,
     });
   }
 
@@ -1833,6 +2248,22 @@ export class WorldEngine {
       this.deerList.push({ group: grp, x: dx, z: dz, yaw: Math.random() * TAU, phase: Math.random() * TAU, minVitality: minV });
     });
 
+    // Agile roaming spirit foxes across the valley & meadows
+    const foxSpots: [number, number][] = [
+      [34, -14],
+      [-28, 30],
+      [48, 38],
+      [-48, -28],
+      [85, 22],
+      [-95, 10],
+    ];
+    foxSpots.forEach(([fx, fz]) => {
+      const grp = createFoxGroup();
+      grp.position.set(fx, groundHeightAt(fx, fz), fz);
+      this.scene.add(grp);
+      this.foxList.push({ group: grp, x: fx, z: fz, yaw: Math.random() * TAU, phase: Math.random() * TAU });
+    });
+
     // Soaring valley birds
     const birdMat = new THREE.MeshBasicMaterial({ color: 0xf4f7ec, side: THREE.DoubleSide });
     for (let i = 0; i < 10; i++) {
@@ -1895,6 +2326,29 @@ export class WorldEngine {
     );
     this.rainPoints.visible = false;
     this.scene.add(this.rainPoints);
+
+    // Seasonal Snowflakes / Autumn Leaves / Magic Spores Particle System
+    const snowCount = 520;
+    const sPos = new Float32Array(snowCount * 3);
+    for (let i = 0; i < snowCount; i++) {
+      sPos[i * 3] = (Math.random() - 0.5) * 86;
+      sPos[i * 3 + 1] = Math.random() * 28;
+      sPos[i * 3 + 2] = (Math.random() - 0.5) * 86;
+    }
+    const sGeo = new THREE.BufferGeometry();
+    sGeo.setAttribute('position', new THREE.BufferAttribute(sPos, 3));
+    this.snowPoints = new THREE.Points(
+      sGeo,
+      new THREE.PointsMaterial({
+        color: 0xeef9ff,
+        size: 0.36,
+        transparent: true,
+        opacity: 0.72,
+        depthWrite: false,
+      }),
+    );
+    this.snowPoints.visible = false;
+    this.scene.add(this.snowPoints);
   }
 
   private syncBuildingsToScene(): void {
@@ -2623,7 +3077,7 @@ export class WorldEngine {
     if (this.state.gameOver) return;
     const prompt = this.findNearbyPrompt();
     if (!prompt) {
-      this.toast('אין אינטראקציה ממש לידך. התקרב לדמות, חומר, שריד, נבג קמילה או מבנה.', 'info');
+      this.toast('אין אינטראקציה ממש לידך. התקרב לדמות, חומר, שריד, שער, נבג קמילה או מבנה.', 'info');
       return;
     }
     if (prompt.kind === 'npc') {
@@ -2641,7 +3095,11 @@ export class WorldEngine {
       }
       this.persist();
       this.emitHud();
-    } else if (prompt.kind === 'resource') {
+    } else if (prompt.kind === 'portal' || prompt.kind === 'landmark') {
+      this.activateLandmark(prompt.id);
+    } else if (prompt.kind === 'water_drink') {
+      this.drinkFromRiver();
+    } else if (prompt.kind === 'forage' || prompt.kind === 'resource') {
       this.gatherNearby();
     } else if (prompt.kind === 'building') {
       this.sound.playSfx('click');
@@ -2657,7 +3115,30 @@ export class WorldEngine {
     }
   }
 
+  private drinkFromRiver(): void {
+    if (this.state.simTime - this.lastRiverDrinkAt < 3) return;
+    this.lastRiverDrinkAt = this.state.simTime;
+    this.state.thirst = Math.min(100, this.state.thirst + 34);
+    this.state.craftInv.dew_flask = Math.min(15, (this.state.craftInv.dew_flask || 0) + 1);
+    this.sound.playSfx('gather');
+    this.toast('שתית מהנחל הטהור (+34 צמא) ומילאת נאד מי טל!', 'good');
+    this.persist();
+    this.emitHud();
+  }
+
   public gatherNearby(): void {
+    // Prefer closest either proximity combinable forage item or WorldResourceNode
+    let bestForageIdx = -1;
+    let bestForageDist = 5.0;
+    for (let i = 0; i < this.proximityItems.length; i++) {
+      const p = this.proximityItems[i].node;
+      const d = Math.hypot(p.x - this.playerX, p.z - this.playerZ);
+      if (d < bestForageDist) {
+        bestForageDist = d;
+        bestForageIdx = i;
+      }
+    }
+
     let best: WorldResourceNode | null = null;
     let bestD = 5.2;
     for (const r of this.resourceNodes) {
@@ -2669,6 +3150,12 @@ export class WorldEngine {
         best = r;
       }
     }
+
+    if (bestForageIdx >= 0 && (!best || bestForageDist <= bestD)) {
+      this.collectProximityItemAt(bestForageIdx);
+      return;
+    }
+
     if (!best) {
       this.toast('אין משאב בטווח איסוף. נסה פעימת תהודה (Q) לגלות מרבצים חבויים.', 'info');
       return;
@@ -2684,6 +3171,482 @@ export class WorldEngine {
     this.toast(`אספת ${RESOURCES[best.type].name}.`, 'good');
     this.persist();
     this.emitHud();
+  }
+
+  private collectProximityItemAt(idx: number): void {
+    const entry = this.proximityItems[idx];
+    if (!entry) return;
+    this.scene.remove(entry.mesh);
+    this.disposeObjectTree(entry.mesh);
+    this.proximityItems.splice(idx, 1);
+
+    const meta = CRAFT_ITEMS[entry.node.itemId];
+    this.state.craftInv[entry.node.itemId] = (this.state.craftInv[entry.node.itemId] || 0) + 1;
+    if (entry.node.isMeteorDrop) {
+      this.state.meteorsHarvested = (this.state.meteorsHarvested || 0) + 1;
+    }
+    this.sound.playSfx('gather');
+    this.toast(`אספת ${meta.name} (חומר משתלב)!`, entry.node.isMeteorDrop ? 'secret' : 'good');
+    this.persist();
+    this.emitHud();
+  }
+
+  private pickProximityItemId(subBiome: SubBiomeId, seasonId: SeasonId): CraftItemId {
+    const r = Math.random();
+    if (subBiome === 'crystal_canyon') {
+      if (r < 0.36) return 'frost_crystal';
+      if (r < 0.56) return 'ember_stone';
+      if (r < 0.74) return 'dew_flask';
+      return r < 0.88 ? 'mushroom' : 'cloth_fiber';
+    }
+    if (subBiome === 'mushroom_grove') {
+      if (r < 0.42) return 'mushroom';
+      if (r < 0.65) return 'herb';
+      if (r < 0.82) return 'honey_sap';
+      return 'berry';
+    }
+    if (subBiome === 'thermal_springs') {
+      if (r < 0.35) return 'ember_stone';
+      if (r < 0.58) return 'spice_root';
+      if (r < 0.78) return 'dew_flask';
+      return 'herb';
+    }
+    if (subBiome === 'obsidian_crags') {
+      if (r < 0.42) return 'ember_stone';
+      if (r < 0.66) return 'spice_root';
+      if (r < 0.84) return 'cloth_fiber';
+      return 'frost_crystal';
+    }
+    if (subBiome === 'bloom_meadow') {
+      if (r < 0.32) return 'berry';
+      if (r < 0.52) return 'honey_sap';
+      if (r < 0.72) return 'herb';
+      if (r < 0.86) return 'dew_flask';
+      return 'cloth_fiber';
+    }
+
+    // Valley core & seasonal availability balance
+    if (seasonId === 'winter') {
+      if (r < 0.24) return 'frost_crystal';
+      if (r < 0.46) return 'spice_root';
+      if (r < 0.64) return 'ember_stone';
+      if (r < 0.78) return 'mushroom';
+      if (r < 0.9) return 'cloth_fiber';
+      return 'dew_flask';
+    }
+    if (seasonId === 'summer') {
+      if (r < 0.28) return 'dew_flask';
+      if (r < 0.5) return 'berry';
+      if (r < 0.68) return 'honey_sap';
+      if (r < 0.82) return 'herb';
+      if (r < 0.92) return 'frost_crystal';
+      return 'cloth_fiber';
+    }
+    if (seasonId === 'autumn') {
+      if (r < 0.26) return 'mushroom';
+      if (r < 0.48) return 'spice_root';
+      if (r < 0.64) return 'berry';
+      if (r < 0.78) return 'honey_sap';
+      if (r < 0.9) return 'cloth_fiber';
+      return 'dew_flask';
+    }
+    // Spring
+    if (r < 0.28) return 'berry';
+    if (r < 0.48) return 'herb';
+    if (r < 0.64) return 'dew_flask';
+    if (r < 0.78) return 'honey_sap';
+    if (r < 0.9) return 'mushroom';
+    return Math.random() < 0.5 ? 'cloth_fiber' : 'spice_root';
+  }
+
+  private stepProximityItems(force = false): void {
+    const { seasonId } = this.getSeasonInfo();
+    const targetCount = Math.max(11, Math.round(18 * SEASONS[seasonId].forageDensityMult));
+
+    // Recycle distant items smoothly around moving player
+    for (let i = this.proximityItems.length - 1; i >= 0; i--) {
+      const entry = this.proximityItems[i];
+      const maxR = entry.node.isMeteorDrop ? 92 : 68;
+      const d = Math.hypot(entry.node.x - this.playerX, entry.node.z - this.playerZ);
+      if (d > maxR) {
+        this.scene.remove(entry.mesh);
+        this.disposeObjectTree(entry.mesh);
+        this.proximityItems.splice(i, 1);
+      }
+    }
+
+    let attempts = 0;
+    const capAttempts = force ? 80 : 24;
+    while (this.proximityItems.length < targetCount && attempts < capAttempts) {
+      attempts++;
+      const angle = Math.random() * TAU;
+      const dist = (force ? 8 : 14) + Math.random() * 40;
+      const x = this.playerX + Math.cos(angle) * dist;
+      const z = this.playerZ + Math.sin(angle) * dist;
+      const y = groundHeightAt(x, z);
+      if (y < WATER_LEVEL + 0.14 || terrainSlopeAt(x, z) > 0.74) continue;
+      if (this.proximityItems.some((p) => Math.hypot(p.node.x - x, p.node.z - z) < 4.5)) continue;
+
+      const subBiome = detectSubBiome(x, z);
+      const itemId = this.pickProximityItemId(subBiome, seasonId);
+      const id = `prox_${Date.now()}_${attempts}_${Math.random().toString(16).slice(2, 6)}`;
+      const mesh = createForageItemMesh(itemId);
+      mesh.position.set(x, y, z);
+      mesh.rotation.y = Math.random() * TAU;
+      this.scene.add(mesh);
+      this.proximityItems.push({
+        node: { id, itemId, x, y, z },
+        mesh,
+      });
+    }
+  }
+
+  public toggleAutoSurvival(): void {
+    this.state.autoSurvivalEnabled = !this.state.autoSurvivalEnabled;
+    this.sound.playSfx('click');
+    this.toast(
+      this.state.autoSurvivalEnabled
+        ? 'הישרדות אוטומטית חכמה הופעלה — המערכת תבשל ותשלים מזון/שתייה/חימום במצבי חירום.'
+        : 'הישרדות אוטומטית כובתה — שליטה ידנית מלאה מהתיק.',
+      'info',
+    );
+    this.persist();
+    this.emitHud();
+  }
+
+  public craftRecipe(recipeId: string, andUse = false): boolean {
+    const recipe = CRAFT_RECIPES.find((r) => r.id === recipeId);
+    if (!recipe) return false;
+    for (const [k, qty] of Object.entries(recipe.ingredients)) {
+      if ((this.state.craftInv[k as CraftItemId] || 0) < (qty || 0)) {
+        this.toast('חסרים פריטים משתלבים בתיק למתכון זה.', 'warn');
+        return false;
+      }
+    }
+    for (const [k, qty] of Object.entries(recipe.ingredients)) {
+      const ck = k as CraftItemId;
+      this.state.craftInv[ck] = Math.max(0, (this.state.craftInv[ck] || 0) - (qty || 0));
+    }
+
+    this.state.recipesCraftedCount = (this.state.recipesCraftedCount || 0) + 1;
+
+    if (recipe.outputId === 'rune_transmute') {
+      if (recipe.resourceBonus) {
+        for (const [rk, rv] of Object.entries(recipe.resourceBonus)) {
+          this.state.inv[rk as ResourceType] = (this.state.inv[rk as ResourceType] || 0) + (rv || 0);
+        }
+      }
+      this.sound.playSfx('craft');
+      this.addJournal(`זיקקת ${recipe.name} ויצרת משאבי רונה ואור-ירח.`, 'survival');
+      this.toast(`זוקק בהצלחה: ${recipe.name}!`, 'secret');
+      this.evaluateAchievements(true);
+      this.persist();
+      this.emitHud();
+      return true;
+    }
+
+    const outId = recipe.outputId;
+    if (outId === 'thermal_cloak') {
+      this.state.hasThermalCloak = true;
+      this.state.warmth = Math.min(100, this.state.warmth + 35);
+      this.sound.playSfx('upgrade');
+      this.addJournal('תפרת גלימת פרווה ותהודה — איבוד החום בחורף פחת ב-58%!', 'survival');
+      this.toast('גלימת הפרווה והתהודה נלבשה! הגנה קבועה מפני הקור.', 'secret');
+    } else {
+      this.state.craftInv[outId] = (this.state.craftInv[outId] || 0) + 1;
+      this.sound.playSfx('craft');
+      this.toast(`הכנת ${recipe.name}!`, 'good');
+      if (andUse) {
+        this.consumeCraftItem(outId);
+      }
+    }
+
+    this.evaluateAchievements(true);
+    this.persist();
+    this.emitHud();
+    return true;
+  }
+
+  public consumeCraftItem(itemId: CraftItemId): boolean {
+    if ((this.state.craftInv[itemId] || 0) <= 0) return false;
+    const meta = CRAFT_ITEMS[itemId];
+    if (itemId === 'thermal_cloak') {
+      this.state.hasThermalCloak = true;
+      this.state.craftInv[itemId]--;
+      this.state.warmth = Math.min(100, this.state.warmth + 35);
+      this.sound.playSfx('upgrade');
+      this.toast('לבשת גלימת פרווה ותהודה!', 'good');
+      this.persist();
+      this.emitHud();
+      return true;
+    }
+    if (
+      !meta.hungerGain &&
+      !meta.thirstGain &&
+      !meta.warmthGain &&
+      !meta.healthGain &&
+      !meta.staminaGain
+    ) {
+      return false;
+    }
+
+    this.state.craftInv[itemId]--;
+    if (meta.hungerGain) this.state.hunger = Math.min(100, this.state.hunger + meta.hungerGain);
+    if (meta.thirstGain) this.state.thirst = Math.min(100, this.state.thirst + meta.thirstGain);
+    if (meta.warmthGain) this.state.warmth = Math.min(100, this.state.warmth + meta.warmthGain);
+    if (meta.healthGain) this.state.health = Math.min(100, this.state.health + meta.healthGain);
+    if (meta.staminaGain) this.state.stamina = Math.min(100, this.state.stamina + meta.staminaGain);
+    if (itemId === 'star_elixir') {
+      this.state.starBuffUntil = this.state.simTime + 90;
+    }
+
+    this.sound.playSfx('consume');
+    this.toast(`צרכת ${meta.name}!`, 'good');
+    this.persist();
+    this.emitHud();
+    return true;
+  }
+
+  private tryAutoSurvival(t: number): void {
+    if (!this.state.autoSurvivalEnabled) return;
+    if (t - this.lastAutoSurviveAt < 2.4) return;
+
+    const tryDirectOrCraft = (
+      existingPriority: CraftItemId[],
+      recipePriority: string[],
+      rawFallback: CraftItemId[],
+      label: string,
+    ): boolean => {
+      for (const id of existingPriority) {
+        if ((this.state.craftInv[id] || 0) > 0) {
+          this.lastAutoSurviveAt = t;
+          this.consumeCraftItem(id);
+          this.toast(`הישרדות אוטומטית (${label}): צרכת ${CRAFT_ITEMS[id].name}`, 'info');
+          return true;
+        }
+      }
+      for (const recId of recipePriority) {
+        const rec = CRAFT_RECIPES.find((r) => r.id === recId);
+        if (!rec) continue;
+        const can = Object.entries(rec.ingredients).every(
+          ([k, qty]) => (this.state.craftInv[k as CraftItemId] || 0) >= (qty || 0),
+        );
+        if (can) {
+          this.lastAutoSurviveAt = t;
+          this.craftRecipe(recId, rec.outputId !== 'thermal_cloak');
+          this.toast(`שילוב חכם אוטומטי (${label}): ${rec.name}`, 'good');
+          return true;
+        }
+      }
+      for (const id of rawFallback) {
+        if ((this.state.craftInv[id] || 0) > 0) {
+          this.lastAutoSurviveAt = t;
+          this.consumeCraftItem(id);
+          this.toast(`הישרדות אוטומטית (${label}): ${CRAFT_ITEMS[id].name}`, 'info');
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (this.state.warmth < 28) {
+      if (
+        !this.state.hasThermalCloak &&
+        tryDirectOrCraft([], ['rec_thermal_cloak'], [], 'מיגון קור')
+      ) {
+        return;
+      }
+      if (
+        tryDirectOrCraft(
+          ['hearth_stew', 'spiced_tea', 'star_elixir'],
+          ['rec_spiced_tea', 'rec_hearth_stew'],
+          ['ember_stone', 'spice_root', 'star_shard'],
+          'חימום',
+        )
+      ) {
+        return;
+      }
+    }
+
+    if (this.state.thirst < 30) {
+      if (
+        tryDirectOrCraft(
+          ['frost_nectar', 'mint_cooler', 'spiced_tea', 'star_elixir'],
+          ['rec_mint_cooler', 'rec_frost_nectar', 'rec_spiced_tea'],
+          ['dew_flask', 'frost_crystal', 'herb', 'berry'],
+          'שתייה',
+        )
+      ) {
+        return;
+      }
+    }
+
+    if (this.state.hunger < 30) {
+      if (
+        tryDirectOrCraft(
+          ['hearth_stew', 'berry_skewer', 'trail_jam', 'star_elixir'],
+          ['rec_trail_jam', 'rec_berry_skewer', 'rec_hearth_stew'],
+          ['berry', 'mushroom', 'honey_sap', 'spice_root'],
+          'מזון',
+        )
+      ) {
+        return;
+      }
+    }
+
+    if (this.state.health < 42) {
+      tryDirectOrCraft(
+        ['healing_salve', 'star_elixir', 'hearth_stew'],
+        ['rec_healing_salve', 'rec_star_elixir'],
+        ['herb', 'star_shard'],
+        'מרפא',
+      );
+    }
+  }
+
+  public teleportToPortal(dest: PortalDestination): void {
+    this.playerX = dest.x;
+    this.playerZ = dest.z;
+    this.playerY = groundHeightAt(dest.x, dest.z) + 0.25;
+    this.playerVy = 0;
+    this.isGrounded = true;
+    this.walkTarget = null;
+    this.walkWaypointMesh.visible = false;
+    this.playerHitCooldownAt = this.state.simTime + 2.5;
+    this.updateFrontierChunks(true);
+    this.stepProximityItems(true);
+    this.sound.playSfx('portal');
+    this.toast(`שוגרת בהצלחה אל ${dest.name}!`, 'secret');
+    this.persist();
+    this.emitHud();
+  }
+
+  private activateLandmark(landmarkId: string): void {
+    const rec = this.chunkLandmarks.get(landmarkId);
+    if (!rec) return;
+
+    if (rec.kind === 'portal') {
+      const already = this.state.discoveredPortals.some((p) => p.id === rec.id);
+      if (!already) {
+        rec.activated = true;
+        this.state.discoveredPortals.push({
+          id: rec.id,
+          name: rec.name,
+          subBiome: rec.subBiome,
+          x: rec.x,
+          z: rec.z,
+        });
+        const mesh = this.landmarkMeshes.get(rec.id);
+        const vMat = mesh?.userData.vortexMat as THREE.MeshBasicMaterial | undefined;
+        if (vMat) {
+          vMat.color.setHex(0x88e9ff);
+          vMat.opacity = 0.62;
+        }
+        this.sound.playSfx('portal');
+        this.addJournal(`חיברת שער שיגור חדש: ${rec.name}.`, 'discovery');
+        this.toast(`שער שיגור חובר: ${rec.name}!`, 'secret');
+        this.evaluateAchievements(true);
+        this.persist();
+        this.emitHud();
+      } else {
+        this.sound.playSfx('portal');
+      }
+      this.callbacks.onOpenPortal?.([
+        { id: 'home_plaza', name: 'כיכר הלב המרכזית', subBiome: 'valley_core', x: -12, z: 2 },
+        ...this.state.discoveredPortals,
+      ]);
+      return;
+    }
+
+    if (rec.activated || this.state.activatedLandmarks.includes(rec.id)) {
+      this.toast(`${rec.name} כבר מהדהד בשלווה.`, 'info');
+      return;
+    }
+
+    rec.activated = true;
+    this.state.activatedLandmarks.push(rec.id);
+    const mesh = this.landmarkMeshes.get(rec.id);
+    const orbMat = mesh?.userData.orbMat as THREE.MeshStandardMaterial | undefined;
+    if (orbMat) {
+      orbMat.color.setHex(0x7ef2c9);
+      orbMat.emissive.setHex(0x3ad49f);
+      orbMat.emissiveIntensity = 0.85;
+    }
+
+    if (rec.kind === 'ancient_temple') {
+      this.state.inv.rune = (this.state.inv.rune || 0) + 2;
+      this.state.inv.glow = (this.state.inv.glow || 0) + 2;
+      this.state.craftInv.star_shard = (this.state.craftInv.star_shard || 0) + 1;
+      this.toast(`${rec.name} התעורר! קיבלת 2 רונות, 2 אור-ירח ושבר כוכבים!`, 'secret');
+    } else {
+      this.state.inv.seed = (this.state.inv.seed || 0) + 2;
+      this.state.craftInv.ember_stone = (this.state.craftInv.ember_stone || 0) + 1;
+      this.state.craftInv.herb = (this.state.craftInv.herb || 0) + 2;
+      this.toast(`${rec.name} הופעל! קיבלת זרעי פלא, אבן גחלת ועשבי מרפא!`, 'secret');
+    }
+
+    this.sound.playSfx('secret');
+    this.addJournal(`חקרת והארת מבנה עתיק: ${rec.name}.`, 'discovery');
+    this.evaluateAchievements(true);
+    this.persist();
+    this.emitHud();
+  }
+
+  private triggerClimateEvent(forceType?: ClimateEventType): void {
+    const { seasonId } = this.getSeasonInfo();
+    let chosen: ClimateEventType = forceType || 'sunbeam_bloom';
+    if (!forceType) {
+      const r = Math.random();
+      if (seasonId === 'winter') {
+        chosen = r < 0.55 ? 'blizzard' : r < 0.82 ? 'magic_fog' : 'meteor_shower';
+      } else if (seasonId === 'summer') {
+        chosen = r < 0.48 ? 'sunbeam_bloom' : r < 0.8 ? 'meteor_shower' : 'magic_fog';
+      } else if (seasonId === 'autumn') {
+        chosen = r < 0.48 ? 'leaf_gust' : r < 0.8 ? 'meteor_shower' : 'magic_fog';
+      } else {
+        chosen = r < 0.42 ? 'sunbeam_bloom' : r < 0.72 ? 'magic_fog' : 'meteor_shower';
+      }
+    }
+
+    this.state.climateEvent = chosen;
+    this.state.climateEventEndsAt = this.state.simTime + (chosen === 'blizzard' ? 58 : 65);
+    this.nextMeteorAt = this.state.simTime + 2.5;
+    if (chosen === 'blizzard') {
+      this.terrainNeedsColorUpdate = true;
+    }
+    const meta = CLIMATE_EVENT_LABELS[chosen];
+    this.toast(`תופעת טבע: ${meta.name} — ${meta.desc}`, chosen === 'blizzard' ? 'warn' : 'secret');
+    this.addJournal(`תופעת אקלים בעמק: ${meta.name}.`, 'discovery');
+    this.emitHud();
+  }
+
+  private spawnMeteor(): void {
+    const ang = Math.random() * TAU;
+    const dist = 16 + Math.random() * 34;
+    const targetX = this.playerX + Math.cos(ang) * dist;
+    const targetZ = this.playerZ + Math.sin(ang) * dist;
+    const targetY = groundHeightAt(targetX, targetZ);
+    if (targetY < WATER_LEVEL + 0.15) return;
+
+    const startX = targetX + (Math.random() - 0.5) * 26;
+    const startY = targetY + 46;
+    const startZ = targetZ + (Math.random() - 0.5) * 26;
+    const flightTime = 1.65;
+    const mesh = createMeteorStreakGroup();
+    mesh.position.set(startX, startY, startZ);
+    this.scene.add(mesh);
+
+    this.fallingMeteors.push({
+      mesh,
+      x: startX,
+      y: startY,
+      z: startZ,
+      vx: (targetX - startX) / flightTime,
+      vy: (targetY - startY) / flightTime,
+      vz: (targetZ - startZ) / flightTime,
+      targetX,
+      targetZ,
+    });
   }
 
   private activateRuinPillar(idx: number): void {
@@ -3105,12 +4068,33 @@ export class WorldEngine {
     }
     this.secretMeshes.clear();
 
-    // Clear Frontier Chunks
+    // Clear Frontier Chunks & Landmarks
     for (const chunk of this.frontierChunks.values()) {
       this.scene.remove(chunk.group);
       this.disposeObjectTree(chunk.group);
     }
     this.frontierChunks.clear();
+    for (const lm of this.landmarkMeshes.values()) {
+      this.scene.remove(lm);
+      this.disposeObjectTree(lm);
+    }
+    this.landmarkMeshes.clear();
+    this.chunkLandmarks.clear();
+    this.skyUpdrafts = [];
+
+    // Clear Proximity Items & Meteors
+    for (const p of this.proximityItems) {
+      this.scene.remove(p.mesh);
+      this.disposeObjectTree(p.mesh);
+    }
+    this.proximityItems = [];
+    for (const m of this.fallingMeteors) {
+      this.scene.remove(m.mesh);
+      this.disposeObjectTree(m.mesh);
+    }
+    this.fallingMeteors = [];
+    this.nextClimateEventAt = 95;
+    this.nextMeteorAt = 0;
     this.lastChunkKey = '';
 
     // Filter non-NPC highlights cleanly
@@ -3155,8 +4139,10 @@ export class WorldEngine {
     this.buildResourcesAndSecrets();
     this.syncBuildingsToScene();
     this.syncProjectsToScene();
+    this.lastSeasonId = this.getSeasonInfo(this.state.day).seasonId;
     this.updateFrontierChunks(true);
     this.updateTerrainVitalityColors();
+    this.stepProximityItems(true);
     this.updateAtmosphereAndDayNight(this.state.simTime);
     this.evaluateAchievements(false);
     this.persist();
@@ -3168,8 +4154,12 @@ export class WorldEngine {
 
   public retryCurrentWorld(): void {
     this.state.health = 100;
+    this.state.hunger = Math.max(82, this.state.hunger);
+    this.state.thirst = Math.max(82, this.state.thirst);
+    this.state.warmth = Math.max(84, this.state.warmth);
     this.state.collapseTimer = 0;
     this.state.gameOver = null;
+    this.state.climateEvent = 'none';
     this.playerX = -12;
     this.playerZ = 2;
     this.playerY = groundHeightAt(this.playerX, this.playerZ);
@@ -3190,9 +4180,10 @@ export class WorldEngine {
     }
 
     this.updateFrontierChunks(true);
+    this.stepProximityItems(true);
     this.persist();
     this.emitHud();
-    this.toast('התעוררת מחדש בכיכר הלב! טהר את נבגי הקמילה והדף רוחות צל עם Q.', 'good');
+    this.toast('התעוררת מחדש בכיכר הלב! שמור על החום, הרעב והצמא וטהר נבגי קמילה.', 'good');
   }
 
   public resetWorld(): void {
@@ -3264,7 +4255,27 @@ export class WorldEngine {
       }
     }
 
-    // 2. Community Projects
+    // 2. Landmarks & Portals
+    for (const rec of this.chunkLandmarks.values()) {
+      if (Math.hypot(rec.x - this.playerX, rec.z - this.playerZ) < 4.8) {
+        return {
+          kind: rec.kind === 'portal' ? 'portal' : 'landmark',
+          id: rec.id,
+          title: rec.name,
+          subtitle:
+            rec.kind === 'portal'
+              ? rec.activated
+                ? 'שער שיגור פעיל — לחץ למעבר מהיר'
+                : 'שער עתיק כבוי — לחץ לחיבור לרשת הפורטלים'
+              : rec.activated
+                ? 'מונומנט מואר'
+                : 'מונומנט עתיק — לחץ לגילוי אוצרות',
+          keyHint: 'E',
+        };
+      }
+    }
+
+    // 2.5 Community Projects
     for (const proj of COMMUNITY_PROJECTS_DATA) {
       if (Math.hypot(proj.x - this.playerX, proj.z - this.playerZ) < 4.6) {
         return {
@@ -3308,6 +4319,20 @@ export class WorldEngine {
       }
     }
 
+    // 4.5 Proximity Combinable Forage Items
+    for (const p of this.proximityItems) {
+      if (Math.hypot(p.node.x - this.playerX, p.node.z - this.playerZ) < 4.0) {
+        const meta = CRAFT_ITEMS[p.node.itemId];
+        return {
+          kind: 'forage',
+          id: p.node.id,
+          title: meta.name,
+          subtitle: meta.desc,
+          keyHint: 'F',
+        };
+      }
+    }
+
     // 5. Resources
     for (const r of this.resourceNodes) {
       if (!r.active) continue;
@@ -3335,6 +4360,18 @@ export class WorldEngine {
           keyHint: 'E',
         };
       }
+    }
+
+    // 7. Riverbank fresh water drinking & flask refill
+    const distRiverBank = Math.abs(this.playerX - riverCenterX(this.playerZ)) - riverHalfWidth(this.playerZ);
+    if (distRiverBank < 4.2 && this.state.thirst < 92) {
+      return {
+        kind: 'water_drink',
+        id: 'river_water',
+        title: 'שפת הנחל הטהור',
+        subtitle: 'שתייה מהזרם (+34 צמא) ומילוי נאד מי טל',
+        keyHint: 'E',
+      };
     }
 
     return null;
@@ -3422,6 +4459,7 @@ export class WorldEngine {
     // Zone-adaptive music + 3D spatial nature ambience
     const activeZone = detectZone(this.playerX, this.playerZ);
     const { isNight } = this.getClockInfo(t);
+    const { seasonId } = this.getSeasonInfo(this.state.day);
     this.sound.update({
       simTime: t,
       weather: this.state.weather,
@@ -3433,6 +4471,9 @@ export class WorldEngine {
       playerZ: this.playerZ,
       camYaw: this.camYaw,
       riverX: riverCenterX(this.playerZ),
+      season: seasonId,
+      climateEvent: this.state.climateEvent,
+      subBiome: detectSubBiome(this.playerX, this.playerZ),
     });
 
     // HUD & Auto-Save
@@ -3485,8 +4526,32 @@ export class WorldEngine {
       this.state.day = newDay;
       const weathers: WeatherType[] = ['clear', 'breeze', 'mist', 'rain'];
       this.state.weather = weathers[newDay % weathers.length];
-      this.toast(`יום ${newDay} בעמק התחיל.`, 'info');
+      const { seasonId, year } = this.getSeasonInfo(newDay);
+      if (seasonId !== this.lastSeasonId) {
+        this.lastSeasonId = seasonId;
+        this.terrainNeedsColorUpdate = true;
+        const sMeta = SEASONS[seasonId];
+        this.addJournal(`שנה ${year}: נכנסנו לעונת ${sMeta.name} — ${sMeta.subtitle}`, 'survival');
+        this.toast(`עונה חדשה התחילה: ${sMeta.name}!`, seasonId === 'winter' ? 'warn' : 'secret');
+      } else {
+        this.toast(`יום ${newDay} בעמק התחיל.`, 'info');
+      }
+      this.evaluateAchievements(true);
     }
+
+    // Dynamic Climate Events cycle
+    if (this.state.climateEvent !== 'none' && t >= this.state.climateEventEndsAt) {
+      const wasBlizzard = this.state.climateEvent === 'blizzard';
+      this.state.climateEvent = 'none';
+      this.nextClimateEventAt = t + 70 + Math.random() * 55;
+      if (wasBlizzard) this.terrainNeedsColorUpdate = true;
+      this.toast('מזג האוויר בעמק התאזן והתופעה האקלימית חלפה.', 'info');
+    } else if (this.state.climateEvent === 'none' && t >= this.nextClimateEventAt) {
+      this.triggerClimateEvent();
+    }
+
+    const { seasonId } = this.getSeasonInfo(this.state.day);
+    const seasonMeta = SEASONS[seasonId];
 
     const cycle = (t % dayLength) / dayLength; // 0..1
     const sunAngle = cycle * TAU;
@@ -3559,7 +4624,6 @@ export class WorldEngine {
         _colA.setHex(horizonSky).lerp(_colC.setHex(0x95c9e0), (k - 0.52) / 0.48);
       }
 
-      // Color temperature shifts deeply warm near horizon, smoothly dipping at sun/moon cross
       if (isDayArc) {
         _colB.setHex(0xff7e45).lerp(_colC.setHex(0xffe0b2), horizonFade);
         this.sunLight.intensity = 0.2 + horizonFade * 1.42;
@@ -3589,8 +4653,15 @@ export class WorldEngine {
       this.renderer.toneMappingExposure = 0.98;
     }
 
-    // Weather modulation on sky & fog density
-    if (this.state.weather === 'mist') {
+    // Weather & seasonal climate modulation on sky & fog density
+    if (this.state.climateEvent === 'blizzard') {
+      _colA.lerp(_colC.setHex(0xa8c3d4), isDayArc ? 0.58 : 0.35);
+      (this.scene.fog as THREE.FogExp2).density = 0.0135;
+      this.sunLight.intensity *= 0.65;
+    } else if (this.state.climateEvent === 'magic_fog') {
+      _colA.lerp(_colC.setHex(0x74639c), isDayArc ? 0.42 : 0.28);
+      (this.scene.fog as THREE.FogExp2).density = 0.0112;
+    } else if (this.state.weather === 'mist') {
       _colA.lerp(_colC.setHex(0x8ba8ad), isDayArc ? 0.45 : 0.25);
       (this.scene.fog as THREE.FogExp2).density = 0.0115;
     } else if (this.state.weather === 'rain') {
@@ -3601,11 +4672,15 @@ export class WorldEngine {
       (this.scene.fog as THREE.FogExp2).density = isDayArc ? 0.0058 : 0.0074;
     }
 
-    // Blend subtle biome atmospheric tint for distinct world identity
+    // Blend subtle biome + season atmospheric tint
     const biomeMeta = BIOME_PRESETS[this.state.biomePreset];
     if (this.state.biomePreset !== 'verdant') {
       _colC.setHex(biomeMeta.skyTintHex);
       _colA.lerp(_colC, this.state.biomePreset === 'mystic_night' ? 0.32 : 0.2);
+    }
+    if (isDayArc) {
+      _colC.setHex(seasonMeta.skyTintHex);
+      _colA.lerp(_colC, 0.16);
     }
 
     this.sunLight.color.copy(_colB);
@@ -3617,11 +4692,33 @@ export class WorldEngine {
     this.skyDome.position.set(this.playerX, 0, this.playerZ);
     this.starsPoints.position.set(this.playerX, 0, this.playerZ);
 
-    // Reactive night elements: stars, fireflies, cottage windows, placed lantern/hearth lights
+    // Reactive night elements: stars, fireflies, snow/leaves/spores, cottage windows, lights
     const nightFactor = THREE.MathUtils.clamp((-sunHeight + 0.12) / 0.5, 0, 1);
-    (this.starsPoints.material as THREE.PointsMaterial).opacity = nightFactor * 0.92;
+    (this.starsPoints.material as THREE.PointsMaterial).opacity =
+      this.state.climateEvent === 'meteor_shower' ? Math.max(0.55, nightFactor * 0.95) : nightFactor * 0.92;
     (this.firefliesPoints.material as THREE.PointsMaterial).opacity = 0.08 + nightFactor * 0.82;
-    this.rainPoints.visible = this.state.weather === 'rain';
+    this.rainPoints.visible = this.state.weather === 'rain' && seasonId !== 'winter';
+
+    const showSeasonParticles =
+      seasonId === 'winter' ||
+      this.state.climateEvent === 'blizzard' ||
+      seasonId === 'autumn' ||
+      this.state.climateEvent === 'leaf_gust' ||
+      this.state.climateEvent === 'magic_fog';
+    this.snowPoints.visible = showSeasonParticles;
+    if (showSeasonParticles) {
+      const sMat = this.snowPoints.material as THREE.PointsMaterial;
+      if (seasonId === 'winter' || this.state.climateEvent === 'blizzard') {
+        sMat.color.setHex(0xeef9ff);
+        sMat.size = this.state.climateEvent === 'blizzard' ? 0.44 : 0.34;
+      } else if (this.state.climateEvent === 'magic_fog') {
+        sMat.color.setHex(0xc9a6ff);
+        sMat.size = 0.4;
+      } else {
+        sMat.color.setHex(0xe88b54);
+        sMat.size = 0.38;
+      }
+    }
 
     const windowGlow = 0.22 + nightFactor * 1.35;
     for (const mat of this.cottageWindowMats) {
@@ -3716,10 +4813,30 @@ export class WorldEngine {
       this.sound.playFootstep(groundHeightAt(this.playerX, this.playerZ) < WATER_LEVEL + 0.15, t);
     }
 
-    // Vertical gravity & terrain / bridge snapping
+    // Wind Updraft Vortex lift to Floating Sky Isles
+    for (const up of this.skyUpdrafts) {
+      if (
+        t - this.lastUpdraftAt > 1.2 &&
+        this.playerY < up.deckY - 1.5 &&
+        Math.hypot(this.playerX - up.x, this.playerZ - up.z) < 2.6
+      ) {
+        this.playerVy = 16.8;
+        this.isGrounded = false;
+        this.lastUpdraftAt = t;
+        this.sound.playSfx('updraft');
+        this.toast('מערבולת רוח שיגרה אותך אל אי השמיים הצף!', 'secret');
+        break;
+      }
+    }
+
+    // Vertical gravity & terrain / bridge / sky platform snapping
     const terrainY = groundHeightAt(this.playerX, this.playerZ);
     const bridgeY = bridgeDeckHeightAt(this.playerX, this.playerZ, this.state.buildings);
-    const floorY = bridgeY !== null ? Math.max(terrainY, bridgeY) : terrainY;
+    const skyY = skyPlatformHeightAt(this.playerX, this.playerZ);
+    let floorY = bridgeY !== null ? Math.max(terrainY, bridgeY) : terrainY;
+    if (skyY !== null && this.playerY >= skyY - 1.2) {
+      floorY = Math.max(floorY, skyY);
+    }
 
     if (!this.isGrounded || this.playerY > floorY + 0.04) {
       this.playerVy -= 24 * dt;
@@ -3745,12 +4862,22 @@ export class WorldEngine {
     this.playerRig.bodyGroup.position.y = moving ? Math.abs(Math.sin(this.playerWalkPhase)) * 0.08 : Math.sin(t * 2.2) * 0.025;
     this.playerRig.scarf.rotation.x = 0.25 + (moving ? (sprinting ? 0.65 : 0.4) : Math.sin(t * 2) * 0.08);
 
-    // Zone arrival detection & achievement tracking
+    // Zone & Sub-Biome arrival detection & achievement tracking
     const zId = detectZone(this.playerX, this.playerZ);
     if (!this.state.visitedZones.includes(zId)) {
       this.state.visitedZones.push(zId);
       this.evaluateAchievements(true);
     }
+    const subId = detectSubBiome(this.playerX, this.playerZ);
+    if (!this.state.visitedSubBiomes.includes(subId)) {
+      this.state.visitedSubBiomes.push(subId);
+      const sbMeta = SUB_BIOMES[subId];
+      this.addJournal(`גילית מחוז ספר חדש: ${sbMeta.name} — ${sbMeta.desc}`, 'discovery');
+      this.toast(`גילית תת-ביום חדש: ${sbMeta.name}!`, 'secret');
+      this.evaluateAchievements(true);
+    }
+    this.lastSubBiomeId = subId;
+
     if (zId !== this.lastZoneId) {
       this.lastZoneId = zId;
       if (zId === 'cavern' && !this.state.cavernLit) {
@@ -3762,21 +4889,30 @@ export class WorldEngine {
       } else if (zId === 'forest') {
         this.toast('נכנסת ליער הערפל והנבגים — לחץ Q כדי לחשוף נבגים חבויים.', 'info');
       } else if (zId === 'frontier') {
-        this.toast('חצית אל מרחבי הספר האינסופיים! היזהר מנבגי קמילה ואסוף משאבים נדירים.', 'secret');
+        this.toast('חצית אל מרחבי הספר האינסופיים! תתי-ביומים, שערים ומטאורים ממתינים לך.', 'secret');
       }
     }
   }
 
-  private triggerGameOver(reason: 'health' | 'collapse'): void {
+  private triggerGameOver(reason: 'health' | 'collapse' | 'starvation' | 'hypothermia'): void {
     if (this.state.gameOver) return;
     const biomeName = BIOME_PRESETS[this.state.biomePreset].name;
+    let title = 'הרוח בעמק כבתה';
+    let message = 'רוחות הצל הכריעו אותך, אך זיכרון העמק עוד מהדהד וממתין לסיבוב נוסף.';
+    if (reason === 'collapse') {
+      title = 'העמק שקע בקמילה';
+      message = 'נבגי הקמילה רוקנו את חיוניות העמק לחלוטין. עליך לפזר אותם בעזרת תהודה (Q) ובנייה מתואמת.';
+    } else if (reason === 'starvation') {
+      title = 'תשישות מרעב וצמא';
+      message = 'נגמרו מאגרי האנרגיה והנוזלים בשטח. אסוף פריטים משתלבים (F) וצור ארוחות וחליטות בתיק (C).';
+    } else if (reason === 'hypothermia') {
+      title = 'קיפאון עמוק בעמק';
+      message = 'הקור העונתי הכריע את חום גופך. חפש מדורות, מעיינות חמים, חליטות ג׳ינג׳ר או גלימת פרווה בחורף.';
+    }
     this.state.gameOver = {
       reason,
-      title: reason === 'health' ? 'הרוח בעמק כבתה' : 'העמק שקע בקמילה',
-      message:
-        reason === 'health'
-          ? 'רוחות הצל והקור הכריעו אותך, אך זיכרון העמק עוד מהדהד וממתין לסיבוב נוסף.'
-          : 'נבגי הקמילה רוקנו את חיוניות העמק לחלוטין. עליך לפזר אותם בעזרת תהודה (Q) ובנייה מתואמת.',
+      title,
+      message,
       daysSurvived: this.state.day,
       blightPurified: this.state.blightPurified,
       vitality: this.computeVitality(),
@@ -3792,7 +4928,12 @@ export class WorldEngine {
   }
 
   private updateThreatsAndHealth(dt: number, t: number): void {
-    const { isNight } = this.getClockInfo(t);
+    const { isNight, cycle } = this.getClockInfo(t);
+    const { seasonId } = this.getSeasonInfo(this.state.day);
+    const sMeta = SEASONS[seasonId];
+    const subBiome = detectSubBiome(this.playerX, this.playerZ);
+    const sbMeta = SUB_BIOMES[subBiome];
+
     const sanctuaries = this.state.buildings.filter(
       (b) => b.type === 'lantern' || b.type === 'resonance' || b.type === 'bench',
     );
@@ -3805,17 +4946,95 @@ export class WorldEngine {
       sanctuaries.some(
         (b) => Math.hypot(this.playerX - b.x, this.playerZ - b.z) < (b.type === 'resonance' ? 20 : 14),
       );
+    const inThermalPool = isInThermalSpringPool(this.playerX, this.playerZ);
+    const starBuffActive = t < (this.state.starBuffUntil || 0);
 
-    // Health regeneration in safe sanctuaries & Benches
-    if (nearBench) {
-      this.state.health = Math.min(100, this.state.health + 4.8 * dt);
-    } else if (inPlazaHearth) {
-      this.state.health = Math.min(100, this.state.health + 2.4 * dt);
+    // Ambient Temperature calculation (°C)
+    const sunHeight = Math.sin(cycle * TAU);
+    const nightChill = Math.max(0, -sunHeight) * sMeta.nightTempDropC;
+    let tempC = sMeta.baseTempC + sbMeta.tempOffsetC - nightChill;
+    if (this.state.climateEvent === 'blizzard') tempC -= 12;
+    else if (this.state.climateEvent === 'sunbeam_bloom') tempC += 5;
+    if (inThermalPool) tempC += 22;
+    else if (nearBench || inPlazaHearth) tempC += 13;
+    else if (nearAnyLight) tempC += 7;
+    this.ambientTempC = Math.round(tempC);
+
+    // Hunger, Thirst & Thermal Warmth Dynamics
+    const sprinting = !!(this.keys['ShiftLeft'] || this.keys['ShiftRight']) && this.state.stamina > 3;
+    const buffMult = starBuffActive ? 0.42 : 1;
+    this.state.hunger = Math.max(
+      0,
+      this.state.hunger - 0.36 * sMeta.hungerDrainMult * (sprinting ? 1.45 : 1) * buffMult * dt,
+    );
+    this.state.thirst = Math.max(
+      0,
+      this.state.thirst -
+        0.46 * sMeta.thirstDrainMult * (sprinting ? 1.5 : 1) * (tempC > 25 ? 1.28 : 1) * buffMult * dt,
+    );
+    if (this.state.weather === 'rain' && seasonId !== 'winter') {
+      this.state.thirst = Math.min(100, this.state.thirst + 1.2 * dt);
+    }
+
+    if (inThermalPool) {
+      this.state.warmth = Math.min(100, this.state.warmth + 24 * dt);
+      this.state.health = Math.min(100, this.state.health + 5.5 * dt);
+    } else if (nearBench) {
+      this.state.warmth = Math.min(100, this.state.warmth + 18 * dt);
+    } else if (inPlazaHearth || nearAnyLight) {
+      this.state.warmth = Math.min(100, this.state.warmth + 11 * dt);
+    } else if (tempC < 8) {
+      const chillRate = (8 - tempC) * (this.state.hasThermalCloak ? 0.08 : 0.19) * buffMult;
+      this.state.warmth = Math.max(0, this.state.warmth - chillRate * dt);
+    } else {
+      this.state.warmth = Math.min(100, this.state.warmth + 4.5 * dt);
+    }
+
+    // Smart Auto-Survival Check before critical health loss
+    this.tryAutoSurvival(t);
+
+    // Low-survival periodic toast warning
+    if (
+      (this.state.hunger < 20 || this.state.thirst < 20 || this.state.warmth < 20) &&
+      t - this.lastSurvivalWarnAt > 28
+    ) {
+      this.lastSurvivalWarnAt = t;
+      if (this.state.warmth < 20) {
+        this.toast('חום הגוף צונח! חפש מדורה, מעיין חם או פתח תיק (C) לחליטה חמה.', 'warn');
+      } else if (this.state.thirst < 20) {
+        this.toast('צמא מסוכן! שתה מהנחל או הכן משקה בתיק (C).', 'warn');
+      } else {
+        this.toast('רעב חמור! אסוף פריטים משתלבים (F) או הכן ארוחה בתיק (C).', 'warn');
+      }
+    }
+
+    let deathCause: 'health' | 'starvation' | 'hypothermia' = 'health';
+
+    if (this.state.hunger <= 0) {
+      this.state.health = Math.max(0, this.state.health - 3.6 * dt);
+      deathCause = 'starvation';
+    }
+    if (this.state.thirst <= 0) {
+      this.state.health = Math.max(0, this.state.health - 4.2 * dt);
+      deathCause = 'starvation';
+    }
+    if (this.state.warmth <= 0) {
+      this.state.health = Math.max(0, this.state.health - 4.5 * dt);
+      deathCause = 'hypothermia';
+    }
+
+    // Health regeneration in safe sanctuaries & Benches (when well-fed & warm)
+    if (this.state.hunger > 20 && this.state.thirst > 20 && this.state.warmth > 20) {
+      if (nearBench) {
+        this.state.health = Math.min(100, this.state.health + 4.8 * dt);
+      } else if (inPlazaHearth) {
+        this.state.health = Math.min(100, this.state.health + 2.4 * dt);
+      }
     }
 
     // Night freezing rain exposure outside lit shelter
     if (isNight && this.state.weather === 'rain' && !nearAnyLight) {
-      this.state.health = Math.max(0, this.state.health - 1.7 * dt);
+      this.state.health = Math.max(0, this.state.health - 1.5 * dt);
       if (t - this.lastExposureWarnAt > 26) {
         this.lastExposureWarnAt = t;
         this.toast('גשם לילי מקפיא! התקרב לפנס, ספסל או לכיכר הלב.', 'warn');
@@ -3869,7 +5088,6 @@ export class WorldEngine {
       const dz = this.playerZ - w.z;
       const dPlayer = Math.hypot(dx, dz);
 
-      // Chase if within detection range (player is safe in inner Plaza hearth during day)
       const aggroRange = isNight ? 46 : 30;
       if (dPlayer < aggroRange && !inPlazaHearth) {
         const wSpeed = isNight ? 6.1 : 4.4;
@@ -3879,17 +5097,15 @@ export class WorldEngine {
         w.z = nz;
         w.yaw = Math.atan2(dx, dz);
       } else {
-        // Gentle prowl orbit around spawn origin
         w.phase += dt * 0.9;
         w.x += Math.cos(w.phase) * 1.4 * dt;
         w.z += Math.sin(w.phase * 0.8) * 1.4 * dt;
         w.yaw = Math.atan2(Math.cos(w.phase), Math.sin(w.phase * 0.8));
       }
 
-      // Melee strike on player
       if (dPlayer < 1.85 && t >= this.playerHitCooldownAt) {
         this.playerHitCooldownAt = t + 1.5;
-        this.state.health = Math.max(0, this.state.health - 18);
+        this.state.health = Math.max(0, this.state.health - (starBuffActive ? 10 : 18));
         this.sound.playSfx('damage');
         this.toast('רוח צל פגעה בך! הפעל תהודה (Q) כדי להדוף ולנפץ אותה!', 'warn');
         if (dPlayer > 0.1) {
@@ -3904,7 +5120,7 @@ export class WorldEngine {
     }
 
     if (this.state.health <= 0) {
-      this.triggerGameOver('health');
+      this.triggerGameOver(deathCause);
     }
   }
 
@@ -4088,7 +5304,7 @@ export class WorldEngine {
       }
     }
 
-    // Animate wildlife
+    // Animate wildlife (deer + agile spirit foxes)
     const vitality = this.computeVitality();
     for (const deer of this.deerList) {
       deer.group.visible = vitality >= deer.minVitality;
@@ -4098,6 +5314,34 @@ export class WorldEngine {
       const nz = deer.z + Math.sin(deer.phase * 0.7) * 3.5;
       deer.group.position.set(nx, groundHeightAt(nx, nz), nz);
       deer.group.rotation.y = -deer.phase;
+    }
+
+    for (const fox of this.foxList) {
+      fox.phase += dt * 0.65;
+      const nx = fox.x + Math.cos(fox.phase) * 5.2;
+      const nz = fox.z + Math.sin(fox.phase * 1.3) * 4.4;
+      const fy = groundHeightAt(nx, nz);
+      fox.group.visible = fy > WATER_LEVEL + 0.05;
+      if (!fox.group.visible) continue;
+      const vx = -Math.sin(fox.phase) * 5.2;
+      const vz = Math.cos(fox.phase * 1.3) * 4.4 * 1.3;
+      fox.group.position.set(nx, fy, nz);
+      fox.group.rotation.y = Math.atan2(vx, vz);
+    }
+
+    // Bob & magnetic auto-collect proximity combinable items
+    for (let i = this.proximityItems.length - 1; i >= 0; i--) {
+      const p = this.proximityItems[i];
+      p.mesh.rotation.y += dt * 1.1;
+      p.mesh.position.y = p.node.y + Math.sin(t * 2.6 + p.node.x) * 0.08;
+      if (
+        !this.pausedForDialog &&
+        !this.state.gameOver &&
+        Math.hypot(p.node.x - this.playerX, p.node.z - this.playerZ) < 1.85 &&
+        Math.abs(p.node.y - this.playerY) < 2.4
+      ) {
+        this.collectProximityItemAt(i);
+      }
     }
 
     this.birdsGroup.children.forEach((bird) => {
@@ -4123,6 +5367,60 @@ export class WorldEngine {
         pos.setY(i, y);
       }
       pos.needsUpdate = true;
+    }
+
+    // Seasonal Snow / Falling Leaves / Magic Spores around player
+    if (this.snowPoints?.visible) {
+      const sPos = this.snowPoints.geometry.attributes.position as THREE.BufferAttribute;
+      const blizzardFactor = this.state.climateEvent === 'blizzard' ? 2.1 : 1.0;
+      for (let i = 0; i < sPos.count; i++) {
+        let sx = sPos.getX(i) + Math.sin(t * 1.4 + i) * 0.9 * blizzardFactor * dt;
+        let sy = sPos.getY(i) - 3.6 * blizzardFactor * dt;
+        let sz = sPos.getZ(i) + Math.cos(t * 1.1 + i) * 0.7 * blizzardFactor * dt;
+        if (sy < 0 || Math.abs(sx - this.playerX) > 48 || Math.abs(sz - this.playerZ) > 48) {
+          sx = this.playerX + (Math.random() - 0.5) * 84;
+          sy = 25 + Math.random() * 6;
+          sz = this.playerZ + (Math.random() - 0.5) * 84;
+        }
+        sPos.setXYZ(i, sx, sy, sz);
+      }
+      sPos.needsUpdate = true;
+    }
+
+    // Meteor Shower Spawns & Falling Meteor Impacts
+    if (this.state.climateEvent === 'meteor_shower' && t >= this.nextMeteorAt) {
+      this.nextMeteorAt = t + 3.4 + Math.random() * 2.4;
+      this.spawnMeteor();
+    }
+    for (let i = this.fallingMeteors.length - 1; i >= 0; i--) {
+      const m = this.fallingMeteors[i];
+      m.x += m.vx * dt;
+      m.y += m.vy * dt;
+      m.z += m.vz * dt;
+      m.mesh.position.set(m.x, m.y, m.z);
+      const impactY = groundHeightAt(m.targetX, m.targetZ);
+      if (m.y <= impactY + 0.4) {
+        this.scene.remove(m.mesh);
+        this.disposeObjectTree(m.mesh);
+        this.fallingMeteors.splice(i, 1);
+
+        const shardMesh = createForageItemMesh('star_shard');
+        shardMesh.position.set(m.targetX, impactY, m.targetZ);
+        this.scene.add(shardMesh);
+        this.proximityItems.push({
+          node: {
+            id: `meteor_${Date.now()}_${i}`,
+            itemId: 'star_shard',
+            x: m.targetX,
+            y: impactY,
+            z: m.targetZ,
+            isMeteorDrop: true,
+          },
+          mesh: shardMesh,
+        });
+        this.sound.playSfx('meteor');
+        this.toast('מטאור נחת בקרבתך והשאיר שבר כוכבים זוהר!', 'secret');
+      }
     }
 
     // Waypoint spin
@@ -4191,7 +5489,7 @@ export class WorldEngine {
       if (fDirty) fPos.needsUpdate = true;
     }
 
-    // Update terrain vertex hydration / blight coloration if needed
+    // Update terrain vertex hydration / blight / seasonal coloration if needed
     if (this.terrainNeedsColorUpdate) {
       this.updateTerrainVitalityColors();
     }
@@ -4370,6 +5668,9 @@ export class WorldEngine {
       changed = true;
     }
 
+    // Stream continuous combinable forage clusters around the player
+    this.stepProximityItems(false);
+
     if (changed) {
       this.evaluateAchievements(true);
       this.emitHud();
@@ -4403,6 +5704,14 @@ export class WorldEngine {
         ).length;
       case 'ach_valley_bloom':
         return this.computeVitality();
+      case 'ach_master_chef':
+        return this.state.recipesCraftedCount || 0;
+      case 'ach_winter_survivor':
+        return this.state.day;
+      case 'ach_biome_explorer':
+        return this.state.visitedSubBiomes.filter((sb) => sb !== 'valley_core').length;
+      case 'ach_portal_weaver':
+        return this.state.discoveredPortals.length;
       default:
         return 0;
     }
@@ -4484,11 +5793,33 @@ export class WorldEngine {
       };
     }
 
+    const { seasonId, dayInSeason, year } = this.getSeasonInfo(this.state.day);
+    const seasonMeta = SEASONS[seasonId];
+    const subBiomeId = detectSubBiome(this.playerX, this.playerZ);
+    const subBiomeMeta = SUB_BIOMES[subBiomeId];
+    const climateMeta = CLIMATE_EVENT_LABELS[this.state.climateEvent || 'none'];
+
     this.callbacks.onHudUpdate({
       inv: { ...this.state.inv },
+      craftInv: { ...this.state.craftInv },
+      autoSurvivalEnabled: this.state.autoSurvivalEnabled,
+      hasThermalCloak: this.state.hasThermalCloak,
+      starBuffActive: this.state.simTime < (this.state.starBuffUntil || 0),
       zoneId: zId,
       zoneName: zMeta.name,
       zoneSubtitle: zMeta.subtitle,
+      subBiomeId,
+      subBiomeName: subBiomeMeta.name,
+      subBiomeDesc: subBiomeMeta.desc,
+      seasonId,
+      seasonName: seasonMeta.name,
+      seasonColor: seasonMeta.color,
+      dayInSeason,
+      seasonLengthDays: SEASON_LENGTH_DAYS,
+      year,
+      ambientTempC: this.ambientTempC,
+      climateEvent: this.state.climateEvent || 'none',
+      climateEventLabel: climateMeta?.name || '',
       day: this.state.day,
       timeOfDayLabel,
       clockLabel,
@@ -4498,6 +5829,9 @@ export class WorldEngine {
       weatherLabel: weatherLabels[this.state.weather],
       vitality,
       health: Math.round(this.state.health),
+      hunger: Math.round(this.state.hunger),
+      thirst: Math.round(this.state.thirst),
+      warmth: Math.round(this.state.warmth),
       stamina: Math.round(this.state.stamina),
       threatLevel,
       activeBlightCount,
@@ -4517,6 +5851,7 @@ export class WorldEngine {
       npcPositions,
       npcMemories: this.state.npcMemories,
       buildings: [...this.state.buildings],
+      discoveredPortals: [...this.state.discoveredPortals],
       completedQuests: [...this.state.completedQuests],
       promises: [...this.state.promises],
       discoveredSecrets: [...this.state.discoveredSecrets],
@@ -4548,6 +5883,18 @@ export class WorldEngine {
       this.disposeObjectTree(chunk.group);
     }
     this.frontierChunks.clear();
+    for (const lm of this.landmarkMeshes.values()) {
+      this.disposeObjectTree(lm);
+    }
+    this.landmarkMeshes.clear();
+    for (const p of this.proximityItems) {
+      this.disposeObjectTree(p.mesh);
+    }
+    this.proximityItems = [];
+    for (const m of this.fallingMeteors) {
+      this.disposeObjectTree(m.mesh);
+    }
+    this.fallingMeteors = [];
     for (const bn of this.blightNodes.values()) {
       this.disposeObjectTree(bn.group);
     }

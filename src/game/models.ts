@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { ProceduralTexturePack } from './textures';
-import type { BlueprintId, ResourceType } from './types';
+import type { BlueprintId, CraftItemId, ResourceType } from './types';
 
 export interface CharacterRig {
   group: THREE.Group;
@@ -1277,4 +1277,508 @@ export function createBoulderClusterGroup(tex: ProceduralTexturePack, tintHex = 
   g.add(main, side);
   return g;
 }
+
+export function createForageItemMesh(itemId: CraftItemId): THREE.Group {
+  const g = new THREE.Group();
+
+  switch (itemId) {
+    case 'berry': {
+      const leafMat = new THREE.MeshStandardMaterial({ color: 0x3f8f4e, roughness: 0.78 });
+      const bush = new THREE.Mesh(new THREE.DodecahedronGeometry(0.46, 1), leafMat);
+      bush.position.y = 0.34;
+      bush.scale.set(1.15, 0.8, 1.15);
+      bush.castShadow = true;
+      g.add(bush);
+      const berryMat = new THREE.MeshStandardMaterial({
+        color: 0xff547c,
+        emissive: 0xa31f47,
+        emissiveIntensity: 0.55,
+        roughness: 0.32,
+      });
+      for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2;
+        const b = new THREE.Mesh(new THREE.SphereGeometry(0.11, 8, 8), berryMat);
+        b.position.set(Math.cos(a) * 0.32, 0.42 + (i % 2) * 0.14, Math.sin(a) * 0.32);
+        g.add(b);
+      }
+      break;
+    }
+    case 'mushroom': {
+      const stem = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.11, 0.16, 0.45, 8),
+        new THREE.MeshStandardMaterial({ color: 0xeadfce, roughness: 0.78 }),
+      );
+      stem.position.y = 0.22;
+      const cap = new THREE.Mesh(
+        new THREE.SphereGeometry(0.38, 12, 10, 0, Math.PI * 2, 0, Math.PI * 0.56),
+        new THREE.MeshStandardMaterial({
+          color: 0xa985ff,
+          emissive: 0x5c36b8,
+          emissiveIntensity: 0.85,
+          roughness: 0.38,
+        }),
+      );
+      cap.position.y = 0.38;
+      cap.castShadow = true;
+      g.add(stem, cap);
+      const spotMat = new THREE.MeshStandardMaterial({
+        color: 0xbef9ff,
+        emissive: 0x7ef2c9,
+        emissiveIntensity: 1.2,
+      });
+      for (let i = 0; i < 4; i++) {
+        const a = (i / 4) * Math.PI * 2;
+        const sp = new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 6), spotMat);
+        sp.position.set(Math.cos(a) * 0.22, 0.56, Math.sin(a) * 0.22);
+        g.add(sp);
+      }
+      break;
+    }
+    case 'herb': {
+      const herbMat = new THREE.MeshStandardMaterial({
+        color: 0x62e3a8,
+        emissive: 0x1d7a53,
+        emissiveIntensity: 0.45,
+        roughness: 0.55,
+      });
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * Math.PI * 2;
+        const blade = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.72, 4), herbMat);
+        blade.position.set(Math.cos(a) * 0.14, 0.32, Math.sin(a) * 0.14);
+        blade.rotation.z = -Math.cos(a) * 0.38;
+        blade.rotation.x = Math.sin(a) * 0.38;
+        g.add(blade);
+      }
+      break;
+    }
+    case 'spice_root': {
+      const rootMat = new THREE.MeshStandardMaterial({
+        color: 0xd98043,
+        emissive: 0x5c2b10,
+        emissiveIntensity: 0.35,
+        roughness: 0.75,
+      });
+      const bulb = new THREE.Mesh(new THREE.DodecahedronGeometry(0.28, 0), rootMat);
+      bulb.position.y = 0.24;
+      bulb.scale.set(1.25, 0.85, 0.9);
+      const sproutMat = new THREE.MeshStandardMaterial({ color: 0xe8b24c, roughness: 0.5 });
+      const stem = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.55, 5), sproutMat);
+      stem.position.y = 0.62;
+      g.add(bulb, stem);
+      break;
+    }
+    case 'dew_flask': {
+      const glass = new THREE.Mesh(
+        new THREE.SphereGeometry(0.28, 12, 12),
+        new THREE.MeshStandardMaterial({
+          color: 0x6ad6ff,
+          emissive: 0x1c84b8,
+          emissiveIntensity: 0.75,
+          roughness: 0.1,
+          transparent: true,
+          opacity: 0.88,
+        }),
+      );
+      glass.position.y = 0.36;
+      const neck = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.09, 0.11, 0.22, 8),
+        new THREE.MeshStandardMaterial({ color: 0xc2935b, roughness: 0.7 }),
+      );
+      neck.position.y = 0.66;
+      g.add(glass, neck);
+      break;
+    }
+    case 'honey_sap': {
+      const cup = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.28, 0.34, 0.22, 8),
+        new THREE.MeshStandardMaterial({ color: 0x6b472b, roughness: 0.88 }),
+      );
+      cup.position.y = 0.11;
+      const orb = new THREE.Mesh(
+        new THREE.SphereGeometry(0.26, 12, 12),
+        new THREE.MeshStandardMaterial({
+          color: 0xffcf59,
+          emissive: 0xd98a1c,
+          emissiveIntensity: 0.85,
+          roughness: 0.18,
+        }),
+      );
+      orb.position.y = 0.42;
+      g.add(cup, orb);
+      break;
+    }
+    case 'ember_stone': {
+      const stone = new THREE.Mesh(
+        new THREE.DodecahedronGeometry(0.34, 0),
+        new THREE.MeshStandardMaterial({
+          color: 0xff6238,
+          emissive: 0xd93514,
+          emissiveIntensity: 1.4,
+          roughness: 0.32,
+        }),
+      );
+      stone.position.y = 0.38;
+      g.add(stone);
+      break;
+    }
+    case 'frost_crystal': {
+      const iceMat = new THREE.MeshStandardMaterial({
+        color: 0xb2f2ff,
+        emissive: 0x4bc3e8,
+        emissiveIntensity: 0.95,
+        roughness: 0.12,
+        metalness: 0.2,
+      });
+      for (let i = 0; i < 3; i++) {
+        const c = new THREE.Mesh(new THREE.OctahedronGeometry(0.22 + i * 0.04, 0), iceMat);
+        c.scale.set(0.7, 1.75, 0.7);
+        c.position.set((i - 1) * 0.18, 0.42 + (i === 1 ? 0.12 : 0), (i % 2) * 0.1);
+        c.rotation.z = (i - 1) * 0.28;
+        g.add(c);
+      }
+      break;
+    }
+    case 'cloth_fiber': {
+      const clothMat = new THREE.MeshStandardMaterial({
+        color: 0xe6d5b8,
+        emissive: 0x453b2c,
+        emissiveIntensity: 0.25,
+        roughness: 0.85,
+      });
+      const roll = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.56, 10), clothMat);
+      roll.rotation.z = Math.PI / 2;
+      roll.position.y = 0.24;
+      const strap = new THREE.Mesh(
+        new THREE.TorusGeometry(0.2, 0.035, 6, 12),
+        new THREE.MeshStandardMaterial({ color: 0x8f5b38, roughness: 0.7 }),
+      );
+      strap.rotation.y = Math.PI / 2;
+      strap.position.y = 0.24;
+      g.add(roll, strap);
+      break;
+    }
+    case 'star_shard':
+    default: {
+      const star = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.36, 0),
+        new THREE.MeshStandardMaterial({
+          color: 0xffe482,
+          emissive: 0xffb326,
+          emissiveIntensity: 1.85,
+          roughness: 0.15,
+          metalness: 0.45,
+        }),
+      );
+      star.position.y = 0.56;
+      const halo = new THREE.Mesh(
+        new THREE.TorusGeometry(0.45, 0.04, 6, 18),
+        new THREE.MeshBasicMaterial({ color: 0xffedaa, transparent: true, opacity: 0.72 }),
+      );
+      halo.rotation.x = Math.PI / 2;
+      halo.position.y = 0.22;
+      g.add(star, halo);
+      break;
+    }
+  }
+
+  return g;
+}
+
+export function createCrystalSpireCluster(accentHex = 0x88e9ff): THREE.Group {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({
+    color: accentHex,
+    emissive: accentHex,
+    emissiveIntensity: 0.78,
+    roughness: 0.16,
+    metalness: 0.28,
+  });
+  for (let i = 0; i < 4; i++) {
+    const h = 2.6 + (i % 3) * 1.4;
+    const shard = new THREE.Mesh(new THREE.ConeGeometry(0.55 + (i === 0 ? 0.22 : 0), h, 5), mat);
+    const ang = (i / 4) * Math.PI * 2;
+    shard.position.set(i === 0 ? 0 : Math.cos(ang) * 0.9, h * 0.45, i === 0 ? 0 : Math.sin(ang) * 0.9);
+    shard.rotation.z = i === 0 ? 0.08 : -Math.cos(ang) * 0.28;
+    shard.rotation.x = i === 0 ? 0 : Math.sin(ang) * 0.28;
+    shard.castShadow = true;
+    g.add(shard);
+  }
+  return g;
+}
+
+export function createGiantMushroomGroup(capHex = 0xf29eb9): THREE.Group {
+  const g = new THREE.Group();
+  const stem = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.32, 0.56, 3.8, 10),
+    new THREE.MeshStandardMaterial({ color: 0xe6dac8, roughness: 0.82 }),
+  );
+  stem.position.y = 1.9;
+  stem.castShadow = true;
+  const cap = new THREE.Mesh(
+    new THREE.SphereGeometry(2.15, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.52),
+    new THREE.MeshStandardMaterial({
+      color: capHex,
+      emissive: capHex,
+      emissiveIntensity: 0.32,
+      roughness: 0.48,
+    }),
+  );
+  cap.position.y = 3.55;
+  cap.castShadow = true;
+  g.add(stem, cap);
+  return g;
+}
+
+export function createThermalSpringGroup(tex: ProceduralTexturePack, radius = 5.5): THREE.Group {
+  const g = new THREE.Group();
+  const rim = new THREE.Mesh(
+    new THREE.TorusGeometry(radius * 0.95, 0.65, 8, 24),
+    new THREE.MeshStandardMaterial({ map: tex.stone, color: 0x80796a, roughness: 0.9 }),
+  );
+  rim.rotation.x = Math.PI / 2;
+  rim.position.y = 0.25;
+  rim.receiveShadow = true;
+  const pool = new THREE.Mesh(
+    new THREE.CircleGeometry(radius * 0.92, 24),
+    new THREE.MeshStandardMaterial({
+      color: 0x56d8e0,
+      emissive: 0x22999e,
+      emissiveIntensity: 0.65,
+      roughness: 0.12,
+      transparent: true,
+      opacity: 0.88,
+    }),
+  );
+  pool.rotation.x = -Math.PI / 2;
+  pool.position.y = 0.22;
+  g.add(rim, pool);
+  return g;
+}
+
+export function createFloatingSkyIsleGroup(tex: ProceduralTexturePack, radius = 7.4): THREE.Group {
+  const g = new THREE.Group();
+  const deck = new THREE.Mesh(
+    new THREE.CylinderGeometry(radius, radius * 0.88, 0.9, 16),
+    new THREE.MeshStandardMaterial({ color: 0x529b6e, roughness: 0.85 }),
+  );
+  deck.position.y = -0.45;
+  deck.receiveShadow = true;
+  deck.castShadow = true;
+  const underRock = new THREE.Mesh(
+    new THREE.ConeGeometry(radius * 0.9, radius * 1.15, 10),
+    new THREE.MeshStandardMaterial({ map: tex.stone, color: 0x627378, roughness: 0.9 }),
+  );
+  underRock.rotation.x = Math.PI;
+  underRock.position.y = -radius * 0.58 - 0.9;
+  underRock.castShadow = true;
+  const crystalCore = new THREE.Mesh(
+    new THREE.OctahedronGeometry(0.95, 0),
+    new THREE.MeshStandardMaterial({
+      color: 0xd4b8ff,
+      emissive: 0x9b6eff,
+      emissiveIntensity: 1.4,
+      roughness: 0.2,
+    }),
+  );
+  crystalCore.position.y = -radius * 1.15 - 1.2;
+  g.add(deck, underRock, crystalCore);
+  return g;
+}
+
+export function createUpdraftVortexGroup(): THREE.Group {
+  const g = new THREE.Group();
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0x88e9ff,
+    transparent: true,
+    opacity: 0.55,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  for (let i = 0; i < 3; i++) {
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(1.5 - i * 0.22, 0.06, 6, 20), ringMat);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.35 + i * 2.1;
+    g.add(ring);
+  }
+  const pillar = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.3, 1.8, 10.5, 14, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0xaef6ff,
+      transparent: true,
+      opacity: 0.14,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    }),
+  );
+  pillar.position.y = 5.25;
+  g.add(pillar);
+  return g;
+}
+
+export function createAncientTempleGroup(tex: ProceduralTexturePack, activated: boolean): THREE.Group {
+  const g = new THREE.Group();
+  const stoneMat = new THREE.MeshStandardMaterial({
+    map: tex.stone,
+    normalMap: tex.stoneNormal,
+    color: 0x7b857e,
+    roughness: 0.88,
+  });
+  const step1 = new THREE.Mesh(new THREE.BoxGeometry(6.4, 0.55, 6.4), stoneMat);
+  step1.position.y = 0.27;
+  step1.receiveShadow = true;
+  const step2 = new THREE.Mesh(new THREE.BoxGeometry(4.6, 0.5, 4.6), stoneMat);
+  step2.position.y = 0.78;
+  step2.receiveShadow = true;
+  g.add(step1, step2);
+
+  [
+    [-1.7, -1.7],
+    [1.7, -1.7],
+    [-1.7, 1.7],
+    [1.7, 1.7],
+  ].forEach(([px, pz]) => {
+    const col = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.34, 3.6, 8), stoneMat);
+    col.position.set(px, 2.8, pz);
+    col.castShadow = true;
+    g.add(col);
+  });
+
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(3.7, 1.8, 4), stoneMat);
+  roof.rotation.y = Math.PI / 4;
+  roof.position.y = 5.35;
+  roof.castShadow = true;
+  g.add(roof);
+
+  const orbMat = new THREE.MeshStandardMaterial({
+    color: activated ? 0x7ef2c9 : 0xf5b971,
+    emissive: activated ? 0x3ad49f : 0xd68934,
+    emissiveIntensity: activated ? 0.75 : 1.5,
+    roughness: 0.2,
+  });
+  const orb = new THREE.Mesh(new THREE.OctahedronGeometry(0.55, 0), orbMat);
+  orb.position.y = 2.05;
+  g.userData.orbMat = orbMat;
+  g.userData.orb = orb;
+  g.add(orb);
+  return g;
+}
+
+export function createStoneCircleGroup(tex: ProceduralTexturePack, activated: boolean): THREE.Group {
+  const g = new THREE.Group();
+  const stoneMat = new THREE.MeshStandardMaterial({
+    map: tex.stone,
+    normalMap: tex.stoneNormal,
+    color: 0x6f7a78,
+    roughness: 0.9,
+  });
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2;
+    const h = 2.4 + (i % 2) * 0.9;
+    const menhir = new THREE.Mesh(new THREE.BoxGeometry(0.75, h, 0.55), stoneMat);
+    menhir.position.set(Math.cos(a) * 3.4, h * 0.5, Math.sin(a) * 3.4);
+    menhir.rotation.y = -a;
+    menhir.castShadow = true;
+    g.add(menhir);
+  }
+  const coreMat = new THREE.MeshStandardMaterial({
+    color: activated ? 0x7ef2c9 : 0xc9a6ff,
+    emissive: activated ? 0x3ad49f : 0x844eff,
+    emissiveIntensity: activated ? 0.8 : 1.55,
+    roughness: 0.2,
+  });
+  const altar = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 1.05, 0.9, 8), stoneMat);
+  altar.position.y = 0.45;
+  const gem = new THREE.Mesh(new THREE.OctahedronGeometry(0.45, 0), coreMat);
+  gem.position.y = 1.6;
+  g.userData.orbMat = coreMat;
+  g.userData.orb = gem;
+  g.add(altar, gem);
+  return g;
+}
+
+export function createTeleportPortalGroup(tex: ProceduralTexturePack, discovered: boolean): THREE.Group {
+  const g = new THREE.Group();
+  const stoneMat = new THREE.MeshStandardMaterial({
+    map: tex.stone,
+    normalMap: tex.stoneNormal,
+    color: 0x5b6473,
+    roughness: 0.86,
+  });
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(2.3, 2.6, 0.45, 12), stoneMat);
+  base.position.y = 0.22;
+  base.receiveShadow = true;
+  const arch = new THREE.Mesh(new THREE.TorusGeometry(2.1, 0.28, 8, 22, Math.PI), stoneMat);
+  arch.position.y = 0.45;
+  arch.castShadow = true;
+  const vortexMat = new THREE.MeshBasicMaterial({
+    color: discovered ? 0x88e9ff : 0xc9a6ff,
+    transparent: true,
+    opacity: discovered ? 0.58 : 0.36,
+    side: THREE.DoubleSide,
+  });
+  const vortex = new THREE.Mesh(new THREE.CircleGeometry(1.85, 24), vortexMat);
+  vortex.position.y = 1.95;
+  g.userData.vortexMat = vortexMat;
+  g.add(base, arch, vortex);
+  return g;
+}
+
+export function createFoxGroup(): THREE.Group {
+  const g = new THREE.Group();
+  const furMat = new THREE.MeshStandardMaterial({
+    color: 0xeb7f3d,
+    emissive: 0x451a05,
+    emissiveIntensity: 0.25,
+    roughness: 0.78,
+  });
+  const tailTipMat = new THREE.MeshStandardMaterial({
+    color: 0xfff2dc,
+    emissive: 0x7ef2c9,
+    emissiveIntensity: 0.35,
+    roughness: 0.6,
+  });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.36, 0.88), furMat);
+  body.position.y = 0.46;
+  body.castShadow = true;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.24, 0.34), furMat);
+  head.position.set(0, 0.66, 0.46);
+  const snout = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.24, 6), furMat);
+  snout.rotation.x = Math.PI / 2;
+  snout.position.set(0, 0.62, 0.72);
+  const tail = new THREE.Mesh(new THREE.ConeGeometry(0.14, 0.65, 6), tailTipMat);
+  tail.rotation.x = -Math.PI * 0.38;
+  tail.position.set(0, 0.54, -0.58);
+  g.add(body, head, snout, tail);
+  [
+    [-0.14, 0.28],
+    [0.14, 0.28],
+    [-0.14, -0.28],
+    [0.14, -0.28],
+  ].forEach(([lx, lz]) => {
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.04, 0.34, 6), furMat);
+    leg.position.set(lx, 0.17, lz);
+    g.add(leg);
+  });
+  return g;
+}
+
+export function createMeteorStreakGroup(): THREE.Group {
+  const g = new THREE.Group();
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(0.45, 10, 10),
+    new THREE.MeshBasicMaterial({ color: 0xffe482 }),
+  );
+  const tail = new THREE.Mesh(
+    new THREE.ConeGeometry(0.32, 3.6, 8),
+    new THREE.MeshBasicMaterial({
+      color: 0xff8f40,
+      transparent: true,
+      opacity: 0.72,
+    }),
+  );
+  tail.position.y = 1.9;
+  g.add(core, tail);
+  return g;
+}
+
 

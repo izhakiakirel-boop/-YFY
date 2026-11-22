@@ -6,11 +6,19 @@ import { HelpModal } from './components/HelpModal';
 import { InspectModal } from './components/InspectModal';
 import { JournalModal } from './components/JournalModal';
 import { Minimap } from './components/Minimap';
-import { NewWorldModal } from './components/NewWorldModal';
+import { PortalModal } from './components/PortalModal';
+import { SatchelModal } from './components/SatchelModal';
 import { TopHud } from './components/TopHud';
 import { TouchControls } from './components/TouchControls';
 import { WorldEngine } from './game/WorldEngine';
-import type { AudioMixSettings, BlueprintId, HudSnapshot, NpcId, ToastMessage } from './game/types';
+import type {
+  AudioMixSettings,
+  BlueprintId,
+  HudSnapshot,
+  NpcId,
+  PortalDestination,
+  ToastMessage,
+} from './game/types';
 
 class AppErrorBoundary extends Component<
   { children: ReactNode },
@@ -69,7 +77,8 @@ function ValleyGameApp() {
   const [inspectProjectId, setInspectProjectId] = useState<string | null>(null);
   const [journalOpen, setJournalOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  const [newWorldOpen, setNewWorldOpen] = useState(false);
+  const [satchelOpen, setSatchelOpen] = useState(false);
+  const [portalList, setPortalList] = useState<PortalDestination[] | null>(null);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [downloadingHtml, setDownloadingHtml] = useState(false);
   const [engineError, setEngineError] = useState<string | null>(null);
@@ -139,6 +148,7 @@ function ValleyGameApp() {
         onBuildModeChange: (bp) => setActiveBlueprint(bp),
         onAudioChange: (enabled) => setAudioOn(enabled),
         onAudioMixChange: (mix) => setAudioMix(mix),
+        onOpenPortal: (portals) => setPortalList(portals),
       });
       engineRef.current = engine;
       setAudioMix(engine.getAudioMix());
@@ -166,14 +176,25 @@ function ValleyGameApp() {
       inspectProjectId ||
       journalOpen ||
       helpOpen ||
-      newWorldOpen ||
+      satchelOpen ||
+      portalList ||
       resetConfirmOpen ||
       hud?.gameOver
     );
     engineRef.current?.setDialogPaused(anyModal, activeNpc);
-  }, [activeNpc, inspectBuildingId, inspectProjectId, journalOpen, helpOpen, newWorldOpen, resetConfirmOpen, hud?.gameOver]);
+  }, [
+    activeNpc,
+    inspectBuildingId,
+    inspectProjectId,
+    journalOpen,
+    helpOpen,
+    satchelOpen,
+    portalList,
+    resetConfirmOpen,
+    hud?.gameOver,
+  ]);
 
-  // Global H (Zen Mode) and Escape shortcuts
+  // Global C (Satchel), H (Zen Mode) and Escape shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target;
@@ -182,19 +203,32 @@ function ValleyGameApp() {
       }
       if (e.code === 'KeyH') {
         setDockCollapsed((prev) => !prev);
+      } else if (e.code === 'KeyC' && !hud?.gameOver) {
+        setSatchelOpen((prev) => !prev);
       } else if (e.code === 'Escape') {
         if (activeNpc) setActiveNpc(null);
         else if (inspectBuildingId) setInspectBuildingId(null);
         else if (inspectProjectId) setInspectProjectId(null);
+        else if (satchelOpen) setSatchelOpen(false);
+        else if (portalList) setPortalList(null);
         else if (journalOpen) setJournalOpen(false);
         else if (helpOpen) setHelpOpen(false);
-        else if (newWorldOpen) setNewWorldOpen(false);
         else if (resetConfirmOpen) setResetConfirmOpen(false);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [activeNpc, inspectBuildingId, inspectProjectId, journalOpen, helpOpen, newWorldOpen, resetConfirmOpen]);
+  }, [
+    activeNpc,
+    inspectBuildingId,
+    inspectProjectId,
+    satchelOpen,
+    portalList,
+    journalOpen,
+    helpOpen,
+    resetConfirmOpen,
+    hud?.gameOver,
+  ]);
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#08161a]">
@@ -229,6 +263,16 @@ function ValleyGameApp() {
         />
       )}
 
+      {/* Freezing frost edge alert when warmth drops low */}
+      {hud && hud.warmth < 25 && !hud.gameOver && (
+        <div
+          className="pointer-events-none fixed inset-0 z-10 transition-opacity duration-300"
+          style={{
+            boxShadow: 'inset 0 0 110px rgba(125, 211, 252, 0.38)',
+          }}
+        />
+      )}
+
       {/* Top Floating Telemetry & Controls */}
       {hud && (
         <TopHud
@@ -246,7 +290,6 @@ function ValleyGameApp() {
           onDownloadHtml={handleDownloadHtml}
           onOpenJournal={() => setJournalOpen(true)}
           onOpenHelp={() => setHelpOpen(true)}
-          onOpenNewWorld={() => setNewWorldOpen(true)}
           onReset={() => setResetConfirmOpen(true)}
         />
       )}
@@ -290,6 +333,7 @@ function ValleyGameApp() {
           onInteract={() => engineRef.current?.interact()}
           onGather={() => engineRef.current?.gatherNearby()}
           onPulse={() => engineRef.current?.triggerPulse()}
+          onOpenSatchel={() => setSatchelOpen(true)}
         />
       )}
 
@@ -343,22 +387,33 @@ function ValleyGameApp() {
       {/* Guide Modal */}
       {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
 
-      {/* Procedural New World Generator Modal */}
-      {hud && newWorldOpen && (
-        <NewWorldModal
-          currentSeedLabel={hud.seedLabel}
-          currentBiome={hud.biomePreset}
-          onCreateWorld={(cfg) => engineRef.current?.generateNewWorld(cfg)}
-          onClose={() => setNewWorldOpen(false)}
+      {/* Satchel & Survival Crafting Workbench */}
+      {hud && satchelOpen && (
+        <SatchelModal
+          hud={hud}
+          onCraft={(recipeId, andUse) => engineRef.current?.craftRecipe(recipeId, andUse)}
+          onConsume={(itemId) => engineRef.current?.consumeCraftItem(itemId)}
+          onToggleAutoSurvival={() => engineRef.current?.toggleAutoSurvival()}
+          onClose={() => setSatchelOpen(false)}
+        />
+      )}
+
+      {/* Fast-Travel Ancient Portals */}
+      {hud && portalList && (
+        <PortalModal
+          portals={portalList}
+          playerPos={hud.playerPos}
+          onTeleport={(dest) => engineRef.current?.teleportToPortal(dest)}
+          onClose={() => setPortalList(null)}
         />
       )}
 
       {/* Game Over / Defeat Modal */}
-      {hud && hud.gameOver && !newWorldOpen && (
+      {hud && hud.gameOver && (
         <GameOverModal
           gameOver={hud.gameOver}
           onRetryWorld={() => engineRef.current?.retryCurrentWorld()}
-          onOpenNewWorld={() => setNewWorldOpen(true)}
+          onResetWorld={() => engineRef.current?.resetWorld()}
         />
       )}
 

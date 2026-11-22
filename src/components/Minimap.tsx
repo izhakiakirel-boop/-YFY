@@ -71,6 +71,21 @@ export function Minimap({ hud, onNavigateTo }: MinimapProps) {
             />
           ))}
 
+          {/* Discovered Portals */}
+          {(hud.discoveredPortals || []).map((p) => {
+            const mx = Math.max(5, Math.min(size - 5, toMap(p.x)));
+            const mz = Math.max(5, Math.min(size - 5, toMap(p.z)));
+            return (
+              <polygon
+                key={p.id}
+                points={`${mx},${mz - 4} ${mx + 4},${mz} ${mx},${mz + 4} ${mx - 4},${mz}`}
+                fill="#88e9ff"
+                stroke="#08161a"
+                strokeWidth="1"
+              />
+            );
+          })}
+
           {/* Patrolling NPCs (live coordinates) */}
           {NPCS_BASE.map((n) => {
             const livePos = hud.npcPositions?.[n.id];
@@ -94,9 +109,9 @@ export function Minimap({ hud, onNavigateTo }: MinimapProps) {
             <polygon points="0,-6 4,4 0,2 -4,4" fill="#ffffff" stroke="#08161a" strokeWidth="1" />
           </g>
         </svg>
-        <div className="text-[10px] text-[#9ec0bd] text-center mt-1 font-medium font-mono-num">
+        <div className="text-[10px] text-[#9ec0bd] text-center mt-1 font-medium font-mono-num truncate max-w-[132px]">
           {isOutInFrontier
-            ? `מרחבי הספר · ${hud.distanceFromOrigin}מ'`
+            ? `${hud.subBiomeName} · ${hud.distanceFromOrigin}מ'`
             : 'מפת העמק · קליק לתנועה'}
         </div>
       </div>

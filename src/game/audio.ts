@@ -1,4 +1,4 @@
-import type { AudioMixSettings, WeatherType, ZoneId } from './types';
+import type { AudioMixSettings, ClimateEventType, SeasonId, SubBiomeId, WeatherType, ZoneId } from './types';
 
 export type SoundEffectKind =
   | 'click'
@@ -10,7 +10,12 @@ export type SoundEffectKind =
   | 'talk'
   | 'complete'
   | 'damage'
-  | 'purify';
+  | 'purify'
+  | 'craft'
+  | 'consume'
+  | 'portal'
+  | 'meteor'
+  | 'updraft';
 
 export interface SpatialAudioFrame {
   simTime: number;
@@ -23,6 +28,9 @@ export interface SpatialAudioFrame {
   playerZ: number;
   camYaw: number;
   riverX: number;
+  season?: SeasonId;
+  climateEvent?: ClimateEventType;
+  subBiome?: SubBiomeId;
 }
 
 const AUDIO_MIX_STORAGE_KEY = 'shozrim-audio-mix-v1';
@@ -674,19 +682,35 @@ export class SoundEngine {
       }
     }
 
-    // 3. Elevation & zone wind whistling layer
+    const season = f.season ?? 'spring';
+    const climate = f.climateEvent ?? 'none';
+    const subBiome = f.subBiome ?? 'valley_core';
+
+    // 3. Elevation, season, blizzard & sky-isles wind whistling layer
     const elevFactor = smoothstep(0.6, 4.2, playerY);
     const zoneWind =
       zone === 'terrace' ? 0.55 : zone === 'ruins' ? 0.35 : zone === 'cavern' ? 0.1 : 0.2;
     const weatherWind =
       weather === 'breeze' ? 1.25 : weather === 'mist' ? 0.95 : weather === 'rain' ? 1.35 : 0.72;
+    const seasonWindMult =
+      climate === 'blizzard'
+        ? 2.25
+        : season === 'winter'
+          ? 1.55
+          : subBiome === 'sky_isles'
+            ? 1.65
+            : 1.0;
     const gustLfo = 0.68 + 0.32 * Math.sin(simTime * 0.42 + playerX * 0.03);
     const windTargetGain =
-      (0.014 + elevFactor * 0.085 + zoneWind * 0.045) * weatherWind * gustLfo;
-    const windPitchHz = 360 + elevFactor * 240 + Math.sin(simTime * 0.57) * 95;
+      (0.014 + elevFactor * 0.085 + zoneWind * 0.045) * weatherWind * seasonWindMult * gustLfo;
+    const windPitchHz =
+      360 +
+      elevFactor * 240 +
+      (climate === 'blizzard' ? 210 : season === 'winter' ? 110 : 0) +
+      Math.sin(simTime * 0.57) * 95;
 
     if (this.windGain && this.windFilter) {
-      this.windGain.gain.setTargetAtTime(windTargetGain, now, 0.45);
+      this.windGain.gain.setTargetAtTime(Math.min(0.24, windTargetGain), now, 0.45);
       this.windFilter.frequency.setTargetAtTime(windPitchHz, now, 0.35);
       if (this.windPan) {
         this.windPan.pan.setTargetAtTime(Math.sin(simTime * 0.24 - camYaw) * 0.55, now, 0.5);
@@ -699,8 +723,14 @@ export class SoundEngine {
       this.rainGain.gain.setTargetAtTime(targetRain, now, 0.8);
     }
 
-    // 5. Randomized Daytime Bird Chirps (biased toward trees & scales with vitality)
-    if (!isNight && zone !== 'cavern' && weather !== 'rain' && simTime >= this.nextBirdAt) {
+    // 5. Randomized Daytime Bird Chirps (quiet in blizzard/winter storms)
+    if (
+      !isNight &&
+      zone !== 'cavern' &&
+      weather !== 'rain' &&
+      climate !== 'blizzard' &&
+      simTime >= this.nextBirdAt
+    ) {
       const treeRichness =
         zone === 'forest'
           ? 1.0
@@ -711,9 +741,10 @@ export class SoundEngine {
               : zone === 'river'
                 ? 0.65
                 : 0.35;
+      const seasonBirdMult = season === 'winter' ? 0.35 : season === 'spring' ? 1.25 : 1.0;
       const vitalityFactor = 0.28 + 0.72 * (vitality / 100);
       const baseWait = 2.6 + Math.random() * 4.2;
-      this.nextBirdAt = simTime + baseWait / (treeRichness * vitalityFactor + 0.2);
+      this.nextBirdAt = simTime + baseWait / (treeRichness * vitalityFactor * seasonBirdMult + 0.2);
 
       // Compute directional stereo pan toward forest canopy or nearby tree crown
       const biasToForest = Math.hypot(FOREST_CANOPY_POS.x - playerX, FOREST_CANOPY_POS.z - playerZ) < 60;
@@ -730,7 +761,14 @@ export class SoundEngine {
     }
 
     // 6. Randomized Nighttime Crickets & Distant Owls
-    if (isNight && zone !== 'cavern' && weather !== 'rain' && simTime >= this.nextNightCritterAt) {
+    if (
+      isNight &&
+      zone !== 'cavern' &&
+      weather !== 'rain' &&
+      season !== 'winter' &&
+      climate !== 'blizzard' &&
+      simTime >= this.nextNightCritterAt
+    ) {
       const vitalityFactor = 0.35 + 0.65 * (vitality / 100);
       this.nextNightCritterAt = simTime + (2.0 + Math.random() * 3.6) / vitalityFactor;
 
@@ -1015,6 +1053,24 @@ export class SoundEngine {
         [440, 554.37, 659.25, 880].forEach((f, idx) =>
           setTimeout(() => this.triggerTone(f, 0.34, 0.16, 'sine'), idx * 55),
         );
+        break;
+      case 'craft':
+        [392, 523.25, 659.25].forEach((f, idx) =>
+          setTimeout(() => this.triggerTone(f, 0.24, 0.16, 'triangle'), idx * 60),
+        );
+        break;
+      case 'consume':
+        this.triggerTone(523.25, 0.14, 0.14, 'sine');
+        setTimeout(() => this.triggerTone(659.25, 0.2, 0.12, 'sine'), 75);
+        break;
+      case 'portal':
+        this.triggerSweep(240, 720, 0.72, 0.2);
+        break;
+      case 'meteor':
+        this.triggerSweep(920, 180, 0.52, 0.22);
+        break;
+      case 'updraft':
+        this.triggerSweep(260, 680, 0.44, 0.18);
         break;
       default:
         break;

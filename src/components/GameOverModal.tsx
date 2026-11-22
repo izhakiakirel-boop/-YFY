@@ -1,23 +1,30 @@
-import { Globe, RotateCcw, ShieldAlert } from 'lucide-react';
+import { RotateCcw, ShieldAlert, Sparkles } from 'lucide-react';
 import type { GameOverState } from '../game/types';
 
 interface GameOverModalProps {
   gameOver: GameOverState;
   onRetryWorld: () => void;
-  onOpenNewWorld: () => void;
+  onResetWorld: () => void;
 }
+
+const REASON_LABELS: Record<GameOverState['reason'], string> = {
+  health: 'תשישות רוחנית',
+  collapse: 'קריסת המערכת האקולוגית',
+  starvation: 'רעב וצמא קיצוניים',
+  hypothermia: 'קיפאון חורפי עמוק',
+};
 
 export function GameOverModal({
   gameOver,
   onRetryWorld,
-  onOpenNewWorld,
+  onResetWorld,
 }: GameOverModalProps) {
   return (
     <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
       <div className="hud-surface-elevated border-rose-500/45 rounded-3xl w-full max-w-md p-6 text-right space-y-4">
         <div className="flex items-center gap-2 text-xs font-bold text-rose-400">
           <ShieldAlert className="w-4 h-4" />
-          <span>{gameOver.reason === 'health' ? 'תשישות רוחנית' : 'קריסת המערכת האקולוגית'}</span>
+          <span>{REASON_LABELS[gameOver.reason]}</span>
         </div>
 
         <div>
@@ -63,11 +70,11 @@ export function GameOverModal({
 
           <button
             type="button"
-            onClick={onOpenNewWorld}
+            onClick={onResetWorld}
             className="w-full py-2.5 rounded-xl bg-white/10 hover:bg-white/15 text-[#edf6f2] text-xs font-semibold flex items-center justify-center gap-2 transition-colors"
           >
-            <Globe className="w-4 h-4 text-[#c9a6ff]" />
-            <span>צור עולם פרוצדורלי חדש</span>
+            <Sparkles className="w-4 h-4 text-[#c9a6ff]" />
+            <span>התחל מסע חדש באקראי</span>
           </button>
         </div>
       </div>

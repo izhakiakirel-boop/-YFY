@@ -1,4 +1,4 @@
-import type { BiomePresetId, PlacedBuilding, ZoneId } from './types';
+import type { BiomePresetId, PlacedBuilding, SubBiomeId, ZoneId } from './types';
 
 export const WORLD_HALF = 118;
 export const CHUNK_SIZE = 80;
@@ -7,6 +7,15 @@ export const WATER_LEVEL = -0.42;
 export const MAIN_BRIDGE_POS = { x: 11.2, z: -14 };
 export const ISLAND_BRIDGE_POS = { x: 37.5, z: 48 };
 export const FORD_Z = 56;
+
+const FRONTIER_SUB_BIOMES: SubBiomeId[] = [
+  'bloom_meadow',
+  'crystal_canyon',
+  'sky_isles',
+  'mushroom_grove',
+  'thermal_springs',
+  'obsidian_crags',
+];
 
 let activeSeed = 104729;
 let activeBiome: BiomePresetId = 'verdant';
@@ -130,10 +139,106 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
   return t * t * (3 - 2 * t);
 }
 
-/**
- * Continuous analytical + seeded infinite procedural terrain height at ANY (x, z).
- */
-export function groundHeightAt(x: number, z: number): number {
+export function detectSubBiome(x: number, z: number): SubBiomeId {
+  const radial = Math.hypot(x, z);
+  if (radial < 112) return 'valley_core';
+
+  // Warped macro-biome cell coordinates (~135m districts)
+  const wx = x + fbm2D(x * 0.008, z * 0.008, activeSeed + 313) * 32;
+  const wz = z + fbm2D(x * 0.008 + 7.2, z * 0.008 - 4.1, activeSeed + 617) * 32;
+  const gx = Math.floor(wx / 135);
+  const gz = Math.floor(wz / 135);
+  const pick = Math.floor(seededFloat(activeSeed + 7919, gx, gz) * FRONTIER_SUB_BIOMES.length);
+  return FRONTIER_SUB_BIOMES[pick % FRONTIER_SUB_BIOMES.length];
+}
+
+export interface SkyIsleDef {
+  x: number;
+  z: number;
+  deckY: number;
+  radius: number;
+  updraftX: number;
+  updraftZ: number;
+}
+
+export function getSkyIsleForChunk(cx: number, cz: number): SkyIsleDef | null {
+  if (Math.abs(cx) <= 1 && Math.abs(cz) <= 1) return null;
+  const centerX = cx * CHUNK_SIZE;
+  const centerZ = cz * CHUNK_SIZE;
+  const sub = detectSubBiome(centerX, centerZ);
+  const r = seededFloat(activeSeed + 4211, cx, cz);
+  const hasIsle = sub === 'sky_isles' ? r < 0.85 : r < 0.16;
+  if (!hasIsle) return null;
+
+  const offX = (seededFloat(activeSeed + 4219, cx, cz) - 0.5) * 34;
+  const offZ = (seededFloat(activeSeed + 4229, cx, cz) - 0.5) * 34;
+  const ix = centerX + offX;
+  const iz = centerZ + offZ;
+  const baseY = baseAnalyticalGroundHeight(ix, iz);
+  const radius = 7.2 + seededFloat(activeSeed + 4241, cx, cz) * 2.4;
+  const deckY = Math.max(WATER_LEVEL + 10.5, baseY + 11.2 + seededFloat(activeSeed + 4253, cx, cz) * 2.8);
+  const ang = seededFloat(activeSeed + 4261, cx, cz) * Math.PI * 2;
+  const updraftX = ix + Math.cos(ang) * (radius + 3.4);
+  const updraftZ = iz + Math.sin(ang) * (radius + 3.4);
+
+  return { x: ix, z: iz, deckY, radius, updraftX, updraftZ };
+}
+
+export function skyPlatformHeightAt(x: number, z: number): number | null {
+  const pcx = Math.round(x / CHUNK_SIZE);
+  const pcz = Math.round(z / CHUNK_SIZE);
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dz = -1; dz <= 1; dz++) {
+      const isle = getSkyIsleForChunk(pcx + dx, pcz + dz);
+      if (!isle) continue;
+      if (Math.hypot(x - isle.x, z - isle.z) <= isle.radius - 0.35) {
+        return isle.deckY;
+      }
+    }
+  }
+  return null;
+}
+
+export interface ThermalSpringDef {
+  x: number;
+  z: number;
+  radius: number;
+}
+
+export function getThermalSpringForChunk(cx: number, cz: number): ThermalSpringDef | null {
+  if (Math.abs(cx) <= 1 && Math.abs(cz) <= 1) return null;
+  const centerX = cx * CHUNK_SIZE;
+  const centerZ = cz * CHUNK_SIZE;
+  const sub = detectSubBiome(centerX, centerZ);
+  const r = seededFloat(activeSeed + 8111, cx, cz);
+  const hasSpring = sub === 'thermal_springs' ? r < 0.85 : r < 0.1;
+  if (!hasSpring) return null;
+
+  const sx = centerX + (seededFloat(activeSeed + 8123, cx, cz) - 0.5) * 34;
+  const sz = centerZ + (seededFloat(activeSeed + 8147, cx, cz) - 0.5) * 34;
+  if (Math.abs(sx - riverCenterX(sz)) < riverHalfWidth(sz) + 8) return null;
+  return {
+    x: sx,
+    z: sz,
+    radius: 5.5 + seededFloat(activeSeed + 8161, cx, cz) * 2.2,
+  };
+}
+
+export function isInThermalSpringPool(x: number, z: number): boolean {
+  const pcx = Math.round(x / CHUNK_SIZE);
+  const pcz = Math.round(z / CHUNK_SIZE);
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dz = -1; dz <= 1; dz++) {
+      const sp = getThermalSpringForChunk(pcx + dx, pcz + dz);
+      if (sp && Math.hypot(x - sp.x, z - sp.z) <= sp.radius) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function baseAnalyticalGroundHeight(x: number, z: number): number {
   // Base gentle valley undulation + biome seeded FBM
   const noiseBase = fbm2D(x * 0.014, z * 0.014, activeSeed);
   const noiseDetail = fbm2D(x * 0.048, z * 0.048, activeSeed + 511);
@@ -145,7 +250,6 @@ export function groundHeightAt(x: number, z: number): number {
     noiseBase * 1.45 * hillMult +
     noiseDetail * 0.35;
 
-  // Preserve quest hub playability around central valley while blending seamlessly into endless frontier
   const radial = Math.hypot(x, z);
   const hubMask = 1 - smoothstep(72, 128, radial);
   const frontierMask = smoothstep(82, 138, radial);
@@ -185,8 +289,30 @@ export function groundHeightAt(x: number, z: number): number {
     const mountain = Math.pow(Math.max(0, ridgeNoise), 2.1) * 13.5 * hillMult;
     const rolling = fbm2D(x * 0.019, z * 0.019, activeSeed + 1901) * 4.2 * hillMult;
     const archipSea = activeBiome === 'archipelago' ? -2.2 + smoothstep(0.1, 0.7, noiseBase) * 3.8 : 0;
-    h += frontierMask * (mountain * 0.68 + rolling + archipSea);
+
+    // Subtle sub-biome flavor sculpting
+    const sub = detectSubBiome(x, z);
+    let subMod = 0;
+    if (sub === 'crystal_canyon') {
+      const stepWave = Math.sin(x * 0.065 + z * 0.04) * 1.8;
+      subMod = Math.round((mountain * 0.45 + stepWave) / 2.2) * 1.5 - 1.2;
+    } else if (sub === 'obsidian_crags') {
+      subMod = Math.pow(Math.max(0, ridgeNoise), 1.6) * 4.2;
+    } else if (sub === 'bloom_meadow') {
+      subMod = -mountain * 0.28;
+    }
+
+    h += frontierMask * (mountain * 0.65 + rolling + archipSea + subMod);
   }
+
+  return h;
+}
+
+/**
+ * Continuous analytical + seeded infinite procedural terrain height at ANY (x, z).
+ */
+export function groundHeightAt(x: number, z: number): number {
+  let h = baseAnalyticalGroundHeight(x, z);
 
   // Carve main river channel extending North/South forever
   const rx = riverCenterX(z);
@@ -225,6 +351,7 @@ export function isWalkableWater(
   buildings: PlacedBuilding[],
 ): boolean {
   if (!isOverWater(x, z)) return true;
+  if (skyPlatformHeightAt(x, z) !== null) return true;
   if (Math.abs(z - FORD_Z) < 2.6 && Math.abs(x - riverCenterX(z)) < riverHalfWidth(z) + 2) {
     return true;
   }
@@ -279,3 +406,4 @@ export function detectZone(x: number, z: number): ZoneId {
   if (x > 26 && z < 32 && z > -55) return 'forest';
   return 'plaza';
 }
+

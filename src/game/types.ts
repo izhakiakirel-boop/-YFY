@@ -10,6 +10,50 @@ export type BlueprintId =
 
 export type WeatherType = 'clear' | 'breeze' | 'mist' | 'rain';
 
+export type SeasonId = 'spring' | 'summer' | 'autumn' | 'winter';
+
+export type ClimateEventType =
+  | 'none'
+  | 'meteor_shower'
+  | 'magic_fog'
+  | 'blizzard'
+  | 'sunbeam_bloom'
+  | 'leaf_gust';
+
+export type SubBiomeId =
+  | 'valley_core'
+  | 'bloom_meadow'
+  | 'crystal_canyon'
+  | 'sky_isles'
+  | 'mushroom_grove'
+  | 'thermal_springs'
+  | 'obsidian_crags';
+
+export type LandmarkKind = 'ancient_temple' | 'stone_circle' | 'portal';
+
+export type CraftItemId =
+  // Raw proximity-spawned combinable items
+  | 'berry'
+  | 'mushroom'
+  | 'herb'
+  | 'spice_root'
+  | 'dew_flask'
+  | 'honey_sap'
+  | 'ember_stone'
+  | 'frost_crystal'
+  | 'cloth_fiber'
+  | 'star_shard'
+  // Crafted consumables & gear
+  | 'trail_jam'
+  | 'berry_skewer'
+  | 'spiced_tea'
+  | 'mint_cooler'
+  | 'frost_nectar'
+  | 'hearth_stew'
+  | 'healing_salve'
+  | 'thermal_cloak'
+  | 'star_elixir';
+
 export type ZoneId =
   | 'plaza'
   | 'river'
@@ -37,6 +81,47 @@ export interface BiomePresetMeta {
   blightRate: number;
 }
 
+export interface SeasonMeta {
+  id: SeasonId;
+  name: string;
+  subtitle: string;
+  color: string;
+  baseTempC: number;
+  nightTempDropC: number;
+  grassTintHex: number;
+  foliageTintHex: number;
+  skyTintHex: number;
+  snowLevel: number; // 0..1
+  hungerDrainMult: number;
+  thirstDrainMult: number;
+  forageDensityMult: number;
+}
+
+export interface CraftItemMeta {
+  id: CraftItemId;
+  name: string;
+  desc: string;
+  color: string;
+  hex: number;
+  kind: 'raw' | 'food' | 'drink' | 'medicine' | 'gear';
+  hungerGain?: number;
+  thirstGain?: number;
+  warmthGain?: number;
+  healthGain?: number;
+  staminaGain?: number;
+}
+
+export interface CraftRecipe {
+  id: string;
+  outputId: CraftItemId | 'rune_transmute';
+  name: string;
+  desc: string;
+  category: 'food' | 'drink' | 'warmth' | 'relic';
+  ingredients: Partial<Record<CraftItemId, number>>;
+  resourceBonus?: Partial<ResourceInventory>;
+  grantBuffSeconds?: number;
+}
+
 export interface WorldSeedConfig {
   seed: number;
   seedLabel: string;
@@ -55,8 +140,36 @@ export interface BlightNodeState {
   chunkKey?: string;
 }
 
+export interface LandmarkRecord {
+  id: string;
+  kind: LandmarkKind;
+  name: string;
+  subBiome: SubBiomeId;
+  x: number;
+  z: number;
+  activated: boolean;
+  chunkKey?: string;
+}
+
+export interface PortalDestination {
+  id: string;
+  name: string;
+  subBiome: SubBiomeId;
+  x: number;
+  z: number;
+}
+
+export interface ProximityItemNode {
+  id: string;
+  itemId: CraftItemId;
+  x: number;
+  y: number;
+  z: number;
+  isMeteorDrop?: boolean;
+}
+
 export interface GameOverState {
-  reason: 'health' | 'collapse';
+  reason: 'health' | 'collapse' | 'starvation' | 'hypothermia';
   title: string;
   message: string;
   daysSurvived: number;
@@ -69,6 +182,7 @@ export interface GameOverState {
 export type NpcId = 'noa' | 'mika' | 'tali' | 'oren';
 
 export type ResourceInventory = Record<ResourceType, number>;
+export type CraftInventory = Record<CraftItemId, number>;
 
 export interface PlacedBuilding {
   id: string;
@@ -155,7 +269,7 @@ export interface CommunityProjectState {
 export interface JournalEntry {
   id: string;
   text: string;
-  kind: 'discovery' | 'build' | 'bond' | 'promise' | 'project';
+  kind: 'discovery' | 'build' | 'bond' | 'promise' | 'project' | 'survival';
   day: number;
 }
 
@@ -211,11 +325,23 @@ export interface GameState {
   seedLabel: string;
   biomePreset: BiomePresetId;
   inv: ResourceInventory;
+  craftInv: CraftInventory;
+  autoSurvivalEnabled: boolean;
+  hasThermalCloak: boolean;
+  starBuffUntil: number;
+  hunger: number; // 0..100
+  thirst: number; // 0..100
+  warmth: number; // 0..100
   completedQuests: string[];
   promises: PromiseRecord[];
   npcMemories: Record<NpcId, NpcMemory>;
   buildings: PlacedBuilding[];
   discoveredSecrets: string[];
+  discoveredPortals: PortalDestination[];
+  activatedLandmarks: string[];
+  visitedSubBiomes: SubBiomeId[];
+  recipesCraftedCount: number;
+  meteorsHarvested: number;
   ruinPillars: boolean[];
   cavernLit: boolean;
   communityProjects: Record<string, number>; // projectId -> stage (0..3)
@@ -233,13 +359,26 @@ export interface GameState {
   simTime: number;
   day: number;
   weather: WeatherType;
+  climateEvent: ClimateEventType;
+  climateEventEndsAt: number;
   playerPos: { x: number; z: number };
   stamina: number;
   tutorialSeen: boolean;
 }
 
 export interface NearbyPrompt {
-  kind: 'npc' | 'resource' | 'building' | 'secret' | 'pillar' | 'project' | 'blight';
+  kind:
+    | 'npc'
+    | 'resource'
+    | 'forage'
+    | 'building'
+    | 'secret'
+    | 'pillar'
+    | 'project'
+    | 'blight'
+    | 'landmark'
+    | 'portal'
+    | 'water_drink';
   id: string;
   title: string;
   subtitle: string;
@@ -248,9 +387,25 @@ export interface NearbyPrompt {
 
 export interface HudSnapshot {
   inv: ResourceInventory;
+  craftInv: CraftInventory;
+  autoSurvivalEnabled: boolean;
+  hasThermalCloak: boolean;
+  starBuffActive: boolean;
   zoneId: ZoneId;
   zoneName: string;
   zoneSubtitle: string;
+  subBiomeId: SubBiomeId;
+  subBiomeName: string;
+  subBiomeDesc: string;
+  seasonId: SeasonId;
+  seasonName: string;
+  seasonColor: string;
+  dayInSeason: number; // 1..5
+  seasonLengthDays: number; // 5
+  year: number;
+  ambientTempC: number;
+  climateEvent: ClimateEventType;
+  climateEventLabel: string;
   day: number;
   timeOfDayLabel: string;
   clockLabel: string;
@@ -260,6 +415,9 @@ export interface HudSnapshot {
   weatherLabel: string;
   vitality: number; // 0..100 valley ecosystem score
   health: number; // 0..100 player survival HP
+  hunger: number; // 0..100
+  thirst: number; // 0..100
+  warmth: number; // 0..100 thermal comfort
   stamina: number; // 0..100
   threatLevel: number; // 0..100 active blight/night threat
   activeBlightCount: number;
@@ -279,6 +437,7 @@ export interface HudSnapshot {
   npcPositions: Record<NpcId, { x: number; z: number; activity: string }>;
   npcMemories: Record<NpcId, NpcMemory>;
   buildings: PlacedBuilding[];
+  discoveredPortals: PortalDestination[];
   completedQuests: string[];
   promises: PromiseRecord[];
   discoveredSecrets: string[];
@@ -304,4 +463,3 @@ export interface AudioMixSettings {
   musicVolume: number; // 0..1
   ambienceVolume: number; // 0..1
 }
-

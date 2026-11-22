@@ -1,4 +1,5 @@
 import {
+  Backpack,
   ChevronDown,
   ChevronUp,
   Droplets,
@@ -12,8 +13,8 @@ import {
   Sprout,
   Trees,
 } from 'lucide-react';
-import { BLUEPRINTS, RESOURCES } from '../game/data';
-import type { BlueprintId, HudSnapshot, ResourceType } from '../game/types';
+import { BLUEPRINTS, CRAFT_RECIPES, RESOURCES } from '../game/data';
+import type { BlueprintId, CraftItemId, HudSnapshot, ResourceType } from '../game/types';
 
 interface BottomDockProps {
   hud: HudSnapshot;
@@ -24,6 +25,7 @@ interface BottomDockProps {
   onInteract: () => void;
   onGather: () => void;
   onPulse: () => void;
+  onOpenSatchel: () => void;
 }
 
 const RES_ICONS: Record<ResourceType, typeof Trees> = {
@@ -43,9 +45,16 @@ export function BottomDock({
   onInteract,
   onGather,
   onPulse,
+  onOpenSatchel,
 }: BottomDockProps) {
   const canAfford = (cost: Partial<Record<ResourceType, number>>) =>
     Object.entries(cost).every(([k, v]) => (hud.inv[k as ResourceType] || 0) >= (v || 0));
+
+  const craftableCount = CRAFT_RECIPES.filter((r) =>
+    Object.entries(r.ingredients).every(
+      ([k, qty]) => (hud.craftInv?.[k as CraftItemId] || 0) >= (qty || 0),
+    ),
+  ).length;
 
   return (
     <div className="pointer-events-none fixed bottom-3 inset-x-0 z-20 flex flex-col items-center px-3">
@@ -95,10 +104,10 @@ export function BottomDock({
 
       {/* Main Dock */}
       {!collapsed && (
-        <div className="pointer-events-auto hud-surface rounded-2xl p-2.5 w-full max-w-[960px] flex flex-col gap-2">
+        <div className="pointer-events-auto hud-surface rounded-2xl p-2.5 w-full max-w-[980px] flex flex-col gap-2">
           {/* Top Row: Resources + World Actions */}
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">
-            <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+            <div className="flex items-center gap-2 sm:gap-2.5 flex-wrap">
               {(Object.keys(RESOURCES) as ResourceType[]).map((key) => {
                 const Icon = RES_ICONS[key];
                 const meta = RESOURCES[key];
@@ -118,7 +127,20 @@ export function BottomDock({
               })}
             </div>
 
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <button
+                onClick={onOpenSatchel}
+                className="px-2.5 py-1.5 rounded-xl bg-[#f5b971]/15 hover:bg-[#f5b971]/25 text-[#ffe1b5] border border-[#f5b971]/35 text-xs font-bold flex items-center gap-1.5 whitespace-nowrap"
+                title="תיק פריטים משתלבים, מתכונים וניהול הישרדות (C)"
+              >
+                <Backpack className="w-3.5 h-3.5 text-[#f5b971]" />
+                <span>תיק ושילובים C</span>
+                {craftableCount > 0 && (
+                  <span className="font-mono-num text-[10px] bg-[#7ef2c9] text-[#072226] rounded-md px-1.5 py-0.2 font-extrabold">
+                    {craftableCount}
+                  </span>
+                )}
+              </button>
               <button
                 onClick={onInteract}
                 className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap"
@@ -130,7 +152,7 @@ export function BottomDock({
               <button
                 onClick={onGather}
                 className="px-2.5 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap"
-                title="איסוף חומרים (F)"
+                title="איסוף חומרים ופריטים משתלבים (F)"
               >
                 <Pickaxe className="w-3.5 h-3.5 text-[#f5b971]" />
                 <span>איסוף F</span>

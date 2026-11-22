@@ -3,7 +3,8 @@ import {
   BookOpen,
   Compass,
   Download,
-  Globe,
+  Droplet,
+  Flame,
   Heart,
   HelpCircle,
   Moon,
@@ -14,6 +15,7 @@ import {
   Sparkles,
   Sun,
   Trees,
+  Utensils,
   Volume2,
   VolumeX,
   X,
@@ -32,7 +34,6 @@ interface TopHudProps {
   onDownloadHtml: () => void;
   onOpenJournal: () => void;
   onOpenHelp: () => void;
-  onOpenNewWorld: () => void;
   onReset: () => void;
 }
 
@@ -48,7 +49,6 @@ export function TopHud({
   onDownloadHtml,
   onOpenJournal,
   onOpenHelp,
-  onOpenNewWorld,
   onReset,
 }: TopHudProps) {
   const [mixerOpen, setMixerOpen] = useState(false);
@@ -69,21 +69,27 @@ export function TopHud({
   const ambiencePct = Math.round(audioMix.ambienceVolume * 100);
   const hpColor =
     hud.health <= 30 ? 'text-rose-400' : hud.health <= 60 ? 'text-[#f5b971]' : 'text-[#8ff2b4]';
+  const hungerColor =
+    hud.hunger <= 25 ? 'text-rose-400' : hud.hunger <= 55 ? 'text-[#f5b971]' : 'text-[#d9a066]';
+  const thirstColor =
+    hud.thirst <= 25 ? 'text-rose-400' : hud.thirst <= 55 ? 'text-[#f5b971]' : 'text-[#63c5ff]';
+  const warmthColor =
+    hud.warmth <= 25 ? 'text-sky-300' : hud.warmth <= 55 ? 'text-[#f5b971]' : 'text-[#ff9c6b]';
 
   return (
     <header className="pointer-events-none fixed top-0 inset-x-0 z-20 flex flex-col gap-2 p-2.5 md:p-4">
       <div className="flex flex-wrap items-center justify-between gap-2 w-full">
-        {/* Right side (RTL start): Zone & World Telemetry */}
-        <div className="pointer-events-auto hud-surface rounded-2xl px-3.5 py-2 flex items-center gap-3 max-w-full min-w-0">
+        {/* Right side (RTL start): Zone, Season & Survival Telemetry */}
+        <div className="pointer-events-auto hud-surface rounded-2xl px-3.5 py-2 flex flex-wrap items-center gap-2.5 max-w-full min-w-0">
           <div className="flex items-center gap-2 min-w-0">
             <Compass className="w-4 h-4 md:w-5 md:h-5 text-[#7ef2c9] shrink-0" />
             <div className="min-w-0">
               <h1 className="font-display text-xs sm:text-sm md:text-base font-bold text-[#edf6f2] truncate">
-                {hud.zoneName}
+                {hud.zoneId === 'frontier' ? hud.subBiomeName : hud.zoneName}
               </h1>
               <p className="text-[11px] text-[#9ec0bd] truncate hidden xl:block">
                 {hud.zoneId === 'frontier'
-                  ? `זרע ${hud.seedLabel} · מרחק ${hud.distanceFromOrigin}מ' מהכיכר`
+                  ? `מרחק ${hud.distanceFromOrigin}מ' · ${hud.subBiomeDesc}`
                   : hud.zoneSubtitle}
               </p>
             </div>
@@ -92,67 +98,74 @@ export function TopHud({
           <button
             type="button"
             onClick={onAdvanceTime}
-            className="hidden sm:flex items-center gap-1.5 text-xs text-[#cfe8e3] hover:text-[#7ef2c9] border-r border-white/10 pr-3 whitespace-nowrap transition-colors shrink-0"
-            title="קדם את השעה בעמק (+3 שעות) לצפייה בזריחה, שקיעה ולילה"
+            className="hidden sm:flex items-center gap-1.5 text-xs text-[#cfe8e3] hover:text-[#7ef2c9] border-r border-white/10 pr-2.5 whitespace-nowrap transition-colors shrink-0"
+            title="קדם את השעה בעמק (+3 שעות) לצפייה בזריחה, שקיעה, לילה ועונות"
           >
             {hud.isNight ? (
               <Moon className="w-3.5 h-3.5 text-[#9bc5ff]" />
             ) : (
               <Sun className="w-3.5 h-3.5 text-[#f5b971]" />
             )}
-            <span className="font-mono-num">יום {hud.day}</span>
+            <span className="font-bold" style={{ color: hud.seasonColor }}>
+              {hud.seasonName}
+            </span>
+            <span className="font-mono-num text-[11px] text-[#9ec0bd]">
+              ({hud.dayInSeason}/{hud.seasonLengthDays})
+            </span>
             <span aria-hidden="true">·</span>
             <span className="font-mono-num">{hud.clockLabel}</span>
-            <span className="hidden md:inline">({hud.timeOfDayLabel})</span>
-            <span className="hidden 2xl:inline text-[#9ec0bd]">· {hud.weatherLabel}</span>
+            <span
+              className={`font-mono-num text-[11px] ${hud.ambientTempC <= 2 ? 'text-sky-300' : hud.ambientTempC >= 28 ? 'text-[#f5b971]' : 'text-[#cfe8e3]'}`}
+              dir="ltr"
+              title="טמפרטורת סביבה"
+            >
+              {hud.ambientTempC}°C
+            </span>
           </button>
 
-          <div className="flex items-center gap-2.5 border-r border-white/10 pr-2.5 text-xs whitespace-nowrap shrink-0">
-            <div className="flex items-center gap-1" title="בריאות (משתקמת בכיכר ובספסלי מפגש)">
+          {/* Compact Survival Vitals: HP, Hunger, Thirst, Warmth, Valley Vitality */}
+          <div className="flex items-center gap-2 border-r border-white/10 pr-2.5 text-xs whitespace-nowrap shrink-0">
+            <div className="flex items-center gap-1" title="בריאות (משתקמת בשובע, חום ובספסלי מפגש)">
               <Heart className={`w-3.5 h-3.5 ${hpColor}`} />
               <span className={`font-mono-num font-bold ${hpColor}`}>{hud.health}</span>
             </div>
-            <span className="text-white/25" aria-hidden="true">/</span>
-            <div className="flex items-center gap-1" title="חיוניות העמק">
+            <div className="flex items-center gap-1" title="רעב — אסוף פירות/פטריות (F) או הכן ארוחות (C)">
+              <Utensils className={`w-3.5 h-3.5 ${hungerColor}`} />
+              <span className={`font-mono-num font-bold ${hungerColor}`}>{hud.hunger}</span>
+            </div>
+            <div className="flex items-center gap-1" title="צמא — שתה מהנחל או הכן חליטות (C)">
+              <Droplet className={`w-3.5 h-3.5 ${thirstColor}`} />
+              <span className={`font-mono-num font-bold ${thirstColor}`}>{hud.thirst}</span>
+            </div>
+            <div className="flex items-center gap-1" title="חום גוף — קריטי בחורף הקיפאון! חפש מדורה, מעיין חם או גלימה">
+              <Flame className={`w-3.5 h-3.5 ${warmthColor}`} />
+              <span className={`font-mono-num font-bold ${warmthColor}`}>{hud.warmth}</span>
+            </div>
+            <span className="text-white/25 hidden md:inline" aria-hidden="true">|</span>
+            <div className="hidden md:flex items-center gap-1" title="חיוניות העמק">
               <Sparkles className="w-3.5 h-3.5 text-[#7ef2c9]" />
               <span className="font-mono-num font-bold text-[#7ef2c9]">{hud.vitality}%</span>
             </div>
             {hud.activeBlightCount > 0 && (
-              <>
-                <span className="text-white/25 hidden md:inline" aria-hidden="true">/</span>
-                <div
-                  className="hidden md:flex items-center gap-1 text-rose-300 font-mono-num"
-                  title="נבגי קמילה פעילים ורוחות צל"
-                >
-                  <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
-                  <span>{hud.activeBlightCount}</span>
-                </div>
-              </>
+              <div
+                className="hidden lg:flex items-center gap-1 text-rose-300 font-mono-num"
+                title="נבגי קמילה פעילים ורוחות צל"
+              >
+                <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+                <span>{hud.activeBlightCount}</span>
+              </div>
             )}
-            <span className="text-white/25 hidden lg:inline" aria-hidden="true">/</span>
-            <div className="hidden lg:block text-[#d4b8ff] font-mono-num" title="סודות שנחשפו">
-              {hud.discoveredSecrets.length}/5 סודות
-            </div>
           </div>
         </div>
 
-        {/* Left side (RTL end): Compact Action Controls */}
+        {/* Left side (RTL end): Compact Action Controls (NO New World button) */}
         <div className="pointer-events-auto flex flex-wrap items-center gap-1.5 md:gap-2">
-          <button
-            onClick={onOpenNewWorld}
-            className="hud-surface border-[#c9a6ff]/45 hover:border-[#c9a6ff] rounded-xl px-2.5 py-2 text-xs font-bold text-[#e2d0ff] flex items-center gap-1.5 transition-colors whitespace-nowrap"
-            title="יצירת עולם פרוצדורלי חדש עם זרע ואקלים לבחירה"
-          >
-            <Globe className="w-4 h-4 text-[#c9a6ff]" />
-            <span className="hidden sm:inline">עולם חדש +</span>
-          </button>
-
           <button
             onClick={onOpenJournal}
             className="hud-surface hover:border-[#7ef2c9]/50 rounded-xl px-3 py-2 text-xs font-semibold text-[#edf6f2] flex items-center gap-1.5 transition-colors whitespace-nowrap"
           >
             <BookOpen className="w-4 h-4 text-[#7ef2c9]" />
-            <span className="hidden sm:inline">יומן ופרויקטים</span>
+            <span className="hidden sm:inline">יומן והישגים</span>
           </button>
 
           <button
@@ -290,6 +303,14 @@ export function TopHud({
           </button>
         </div>
       </div>
+
+      {/* Active Climate Event Indicator */}
+      {hud.climateEvent !== 'none' && hud.climateEventLabel && (
+        <div className="pointer-events-auto self-center hud-surface border-[#ffe082]/45 bg-[#0c2026]/90 text-[#ffeaa3] rounded-2xl px-4 py-1 text-xs font-bold flex items-center gap-2">
+          <Sparkles className="w-3.5 h-3.5 text-[#ffe082] shrink-0" />
+          <span>תופעת טבע פעילה: {hud.climateEventLabel}</span>
+        </div>
+      )}
 
       {/* Urgent Threat / Collapse Banner */}
       {hud.collapseCountdown !== null && (
